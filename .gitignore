@@ -1,6 +1,7 @@
 # Binary
 gospeak
 gospeak.exe
+dist/
 
 # Test files
 *.mp3
