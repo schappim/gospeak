@@ -27,6 +27,8 @@ brew tap schappim/gospeak
 brew install gospeak
 ```
 
+See the [homebrew-gospeak](https://github.com/schappim/homebrew-gospeak) tap for more details.
+
 ### Download Binary
 
 Download the latest release from the [releases page](https://github.com/schappim/gospeak/releases).
