@@ -20,6 +20,13 @@ A self-contained command-line tool for text-to-speech using OpenAI's TTS API. Wr
 
 ## Installation
 
+### Homebrew (Recommended)
+
+```bash
+brew tap schappim/gospeak
+brew install gospeak
+```
+
 ### Download Binary
 
 Download the latest release from the [releases page](https://github.com/schappim/gospeak/releases).
