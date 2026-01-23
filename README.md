@@ -1,10 +1,10 @@
 # gospeak
 
-A self-contained command-line tool for text-to-speech using OpenAI or ElevenLabs TTS APIs. Written in Go with no external dependencies like ffmpeg - just a single binary.
+A self-contained command-line tool for text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS APIs. Written in Go with no external dependencies like ffmpeg - just a single binary.
 
 ## Features
 
-- **Multiple TTS providers**: OpenAI and ElevenLabs
+- **Multiple TTS providers**: OpenAI, ElevenLabs, and Deepgram
 - **No ffmpeg required** - uses native Go audio libraries
 - Multiple voice options for each provider
 - Standard and HD quality models
@@ -16,7 +16,7 @@ A self-contained command-line tool for text-to-speech using OpenAI or ElevenLabs
 ## Requirements
 
 - macOS, Linux, or Windows
-- API key for your chosen provider (OpenAI or ElevenLabs)
+- API key for your chosen provider (OpenAI, ElevenLabs, or Deepgram)
 
 ## Installation
 
@@ -57,6 +57,9 @@ export OPENAI_API_KEY="your-openai-api-key"
 
 # For ElevenLabs
 export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
+
+# For Deepgram
+export DEEPGRAM_API_KEY="your-deepgram-api-key"
 ```
 
 Or pass the key directly with the `--token` flag.
@@ -110,6 +113,28 @@ You can also use any ElevenLabs voice_id directly:
 ```bash
 gospeak -p elevenlabs -v "21m00Tcm4TlvDq8ikWAM" "Using voice ID directly"
 ```
+
+### Using Deepgram
+
+```bash
+# Switch to Deepgram provider
+gospeak -p deepgram "Hello from Deepgram"
+
+# Use a specific Deepgram voice
+gospeak -p deepgram -v asteria "Hello with Asteria"
+gospeak -p deepgram -v luna "Hello with Luna"
+
+# Use Aura 2 voices
+gospeak -p deepgram -v thalia "Hello with Thalia (Aura 2)"
+gospeak -p deepgram -v apollo "Hello with Apollo (Aura 2)"
+
+# Use a full model name directly
+gospeak -p deepgram -v "aura-asteria-en" "Using model name directly"
+```
+
+**Deepgram voices:** `asteria` (default), `luna`, `stella`, `athena`, `hera`, `orion`, `arcas`, `perseus`, `angus`, `orpheus`, `helios`, `zeus`
+
+**Deepgram Aura 2 voices:** `thalia`, `andromeda`, `helena`, `jason`, `apollo`, `ares`
 
 ### Hear All Voices (OpenAI)
 
@@ -197,14 +222,14 @@ gospeak -p elevenlabs -m eleven_turbo_v2_5 "Turbo model"
 
 ## Provider Comparison
 
-| Feature | OpenAI | ElevenLabs |
-|---------|--------|------------|
-| Env var | `OPENAI_API_KEY` | `ELEVENLABS_API_KEY` |
-| Default voice | `alloy` | `rachel` |
-| Default model | `tts-1-hd` | `eleven_multilingual_v2` |
-| Speed range | 0.25 - 4.0 | 0.7 - 1.2 |
-| Voice count | 6 built-in | 14 presets + custom |
-| Custom voices | No | Yes (via voice_id) |
+| Feature | OpenAI | ElevenLabs | Deepgram |
+|---------|--------|------------|----------|
+| Env var | `OPENAI_API_KEY` | `ELEVENLABS_API_KEY` | `DEEPGRAM_API_KEY` |
+| Default voice | `alloy` | `rachel` | `asteria` |
+| Default model | `tts-1-hd` | `eleven_multilingual_v2` | `aura-asteria-en` |
+| Speed range | 0.25 - 4.0 | 0.7 - 1.2 | Not supported |
+| Voice count | 6 built-in | 14 presets + custom | 18 presets + custom |
+| Custom voices | No | Yes (via voice_id) | Yes (via model name) |
 
 ## Scripting Examples
 
@@ -236,13 +261,18 @@ llm "Tell me a joke" | gospeak -v nova
 
 # Use ElevenLabs for more natural speech
 llm "Tell me a story" | gospeak -p elevenlabs -v josh
+
+# Use Deepgram
+llm "Tell me a fact" | gospeak -p deepgram -v asteria
 ```
 
 ### Compare providers
 
 ```bash
-# Same text with both providers
-gospeak "Hello world" && gospeak -p elevenlabs "Hello world"
+# Same text with all providers
+gospeak "Hello world"
+gospeak -p elevenlabs "Hello world"
+gospeak -p deepgram "Hello world"
 ```
 
 ## Error Handling
@@ -252,9 +282,11 @@ When an error occurs, the tool outputs a message to stderr:
 ```
 Error: OPENAI_API_KEY environment variable not set and --token not provided
 Error: ELEVENLABS_API_KEY environment variable not set and --token not provided
-Error: Invalid provider 'invalid'. Use 'openai' or 'elevenlabs'
+Error: DEEPGRAM_API_KEY environment variable not set and --token not provided
+Error: Invalid provider 'invalid'. Use 'openai', 'elevenlabs', or 'deepgram'
 Error: Speed must be between 0.25 and 4.0 for OpenAI
 Error: Speed must be between 0.7 and 1.2 for ElevenLabs
+Warning: Speed adjustment is not supported for Deepgram, ignoring
 ```
 
 ## Help
