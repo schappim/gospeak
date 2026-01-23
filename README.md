@@ -1,14 +1,14 @@
 # gospeak
 
-A self-contained command-line tool for text-to-speech using OpenAI's TTS API. Written in Go with no external dependencies like ffmpeg - just a single binary.
+A self-contained command-line tool for text-to-speech using OpenAI or ElevenLabs TTS APIs. Written in Go with no external dependencies like ffmpeg - just a single binary.
 
 ## Features
 
-- Text-to-speech using OpenAI's TTS API
+- **Multiple TTS providers**: OpenAI and ElevenLabs
 - **No ffmpeg required** - uses native Go audio libraries
-- Six voice options: alloy, echo, fable, onyx, nova, shimmer
+- Multiple voice options for each provider
 - Standard and HD quality models
-- Adjustable speech speed (0.25x to 4.0x)
+- Adjustable speech speed
 - Read from arguments or stdin (perfect for piping)
 - Save to MP3 or play directly
 - Cross-platform audio playback
@@ -16,7 +16,7 @@ A self-contained command-line tool for text-to-speech using OpenAI's TTS API. Wr
 ## Requirements
 
 - macOS, Linux, or Windows
-- OpenAI API key
+- API key for your chosen provider (OpenAI or ElevenLabs)
 
 ## Installation
 
@@ -47,22 +47,26 @@ go build -o gospeak .
 sudo cp gospeak /usr/local/bin/
 ```
 
-### First Run
+### Configuration
 
-Set your OpenAI API key:
+Set your API key(s) as environment variables:
 
 ```bash
-export OPENAI_API_KEY="your-api-key-here"
+# For OpenAI (default provider)
+export OPENAI_API_KEY="your-openai-api-key"
+
+# For ElevenLabs
+export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
 ```
 
-Or pass it directly with the `--token` flag.
+Or pass the key directly with the `--token` flag.
 
 ## Usage
 
-### Basic Usage
+### Basic Usage (OpenAI)
 
 ```bash
-# Speak text directly
+# Speak text directly (uses OpenAI by default)
 gospeak "Hello, world!"
 
 # Pipe text from another command
@@ -72,18 +76,44 @@ echo "Hello from the command line" | gospeak
 cat article.txt | gospeak
 ```
 
+### Using ElevenLabs
+
+```bash
+# Switch to ElevenLabs provider
+gospeak -p elevenlabs "Hello from ElevenLabs"
+
+# Use a specific ElevenLabs voice
+gospeak -p elevenlabs -v josh "Hello with Josh's voice"
+
+# Use a custom voice_id directly
+gospeak -p elevenlabs -v "your-custom-voice-id" "Hello"
+```
+
 ### Choose a Voice
 
-Available voices: `alloy` (default), `echo`, `fable`, `onyx`, `nova`, `shimmer`
+**OpenAI voices:** `alloy` (default), `echo`, `fable`, `onyx`, `nova`, `shimmer`
 
 ```bash
 gospeak -v nova "Hello with the nova voice"
 gospeak -v echo "This is the echo voice"
 ```
 
-### Hear All Voices
+**ElevenLabs voices:** `rachel` (default), `domi`, `bella`, `antoni`, `elli`, `josh`, `arnold`, `adam`, `sam`, `george`, `charlie`, `emily`, `lily`, `michael`
 
-Demo all voices with the same text (announces each voice first):
+```bash
+gospeak -p elevenlabs -v rachel "Hello with Rachel's voice"
+gospeak -p elevenlabs -v josh "Hello with Josh's voice"
+```
+
+You can also use any ElevenLabs voice_id directly:
+
+```bash
+gospeak -p elevenlabs -v "21m00Tcm4TlvDq8ikWAM" "Using voice ID directly"
+```
+
+### Hear All Voices (OpenAI)
+
+Demo all OpenAI voices with the same text:
 
 ```bash
 gospeak --all "The quick brown fox jumps over the lazy dog"
@@ -101,36 +131,80 @@ gospeak -o output.mp3 -s "Save and speak at the same time"
 
 ### Adjust Speed
 
-Speed ranges from 0.25 (slow) to 4.0 (fast):
+**OpenAI:** Speed ranges from 0.25 (slow) to 4.0 (fast)
 
 ```bash
 gospeak -x 0.5 "Speaking slowly"
-gospeak -x 1.5 "Speaking faster"
-gospeak -x 2.0 "Speaking even faster"
+gospeak -x 2.0 "Speaking faster"
 ```
 
-### Use HD Model
+**ElevenLabs:** Speed ranges from 0.7 to 1.2
 
 ```bash
-# Default is tts-1-hd, but you can explicitly set it
-gospeak -m tts-1-hd "High definition audio quality"
+gospeak -p elevenlabs -x 0.8 "Speaking a bit slower"
+gospeak -p elevenlabs -x 1.2 "Speaking faster"
+```
 
-# Or use the faster standard model
-gospeak -m tts-1 "Standard quality, lower latency"
+### ElevenLabs Voice Settings
+
+Fine-tune ElevenLabs voice output:
+
+```bash
+# Adjust stability (0.0-1.0, default: 0.5)
+gospeak -p elevenlabs --stability 0.8 "More stable voice"
+
+# Adjust similarity boost (0.0-1.0, default: 0.75)
+gospeak -p elevenlabs --similarity 0.9 "Higher similarity to original voice"
+```
+
+### Use Different Models
+
+**OpenAI:**
+
+```bash
+# HD model (default)
+gospeak -m tts-1-hd "High definition audio"
+
+# Standard model (faster, lower quality)
+gospeak -m tts-1 "Standard quality"
+```
+
+**ElevenLabs:**
+
+```bash
+# Multilingual v2 (default)
+gospeak -p elevenlabs -m eleven_multilingual_v2 "Multilingual model"
+
+# Turbo v2.5 (faster)
+gospeak -p elevenlabs -m eleven_turbo_v2_5 "Turbo model"
 ```
 
 ## Options
 
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
-| `--voice` | `-v` | Voice to use | `alloy` |
-| `--model` | `-m` | Model to use (`tts-1`, `tts-1-hd`) | `tts-1-hd` |
+| `--provider` | `-p` | TTS provider (`openai`, `elevenlabs`) | `openai` |
+| `--voice` | `-v` | Voice to use | Provider-specific |
+| `--model` | `-m` | Model to use | Provider-specific |
 | `--output` | `-o` | Save audio to file | - |
-| `--speed` | `-x` | Speech speed (0.25-4.0) | `1.0` |
+| `--speed` | `-x` | Speech speed | `1.0` |
 | `--speak` | `-s` | Play audio even when saving to file | `false` |
-| `--token` | - | OpenAI API key | `$OPENAI_API_KEY` |
-| `--all` | - | Speak with all voices | `false` |
+| `--token` | - | API key | From env var |
+| `--all` | - | Speak with all voices (OpenAI only) | `false` |
+| `--stability` | - | Voice stability (ElevenLabs only) | `0.5` |
+| `--similarity` | - | Similarity boost (ElevenLabs only) | `0.75` |
 | `--help` | `-h` | Show help message | - |
+
+## Provider Comparison
+
+| Feature | OpenAI | ElevenLabs |
+|---------|--------|------------|
+| Env var | `OPENAI_API_KEY` | `ELEVENLABS_API_KEY` |
+| Default voice | `alloy` | `rachel` |
+| Default model | `tts-1-hd` | `eleven_multilingual_v2` |
+| Speed range | 0.25 - 4.0 | 0.7 - 1.2 |
+| Voice count | 6 built-in | 14 presets + custom |
+| Custom voices | No | Yes (via voice_id) |
 
 ## Scripting Examples
 
@@ -159,6 +233,16 @@ done
 ```bash
 # Pipe output from an LLM CLI tool
 llm "Tell me a joke" | gospeak -v nova
+
+# Use ElevenLabs for more natural speech
+llm "Tell me a story" | gospeak -p elevenlabs -v josh
+```
+
+### Compare providers
+
+```bash
+# Same text with both providers
+gospeak "Hello world" && gospeak -p elevenlabs "Hello world"
 ```
 
 ## Error Handling
@@ -167,8 +251,10 @@ When an error occurs, the tool outputs a message to stderr:
 
 ```
 Error: OPENAI_API_KEY environment variable not set and --token not provided
-Error: Invalid voice 'invalid'. Valid voices: alloy, echo, fable, onyx, nova, shimmer
-Error: Speed must be between 0.25 and 4.0
+Error: ELEVENLABS_API_KEY environment variable not set and --token not provided
+Error: Invalid provider 'invalid'. Use 'openai' or 'elevenlabs'
+Error: Speed must be between 0.25 and 4.0 for OpenAI
+Error: Speed must be between 0.7 and 1.2 for ElevenLabs
 ```
 
 ## Help
