@@ -531,5 +531,8 @@ func playAudio(audioData []byte) error {
 		time.Sleep(10 * time.Millisecond)
 	}
 
+	// Allow audio buffer to fully drain
+	time.Sleep(1 * time.Second)
+
 	return nil
 }
