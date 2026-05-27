@@ -104,3 +104,48 @@ func TestStripID3v2_RemovesLeadingTag(t *testing.T) {
 		}
 	}
 }
+
+func TestIsValidOpenAIVoice(t *testing.T) {
+	for _, v := range openAIVoices {
+		if !isValidOpenAIVoice(v) {
+			t.Errorf("expected %q to be valid", v)
+		}
+	}
+	for _, v := range []string{"", "rachel", "asteria", "ALLOY"} {
+		if isValidOpenAIVoice(v) {
+			t.Errorf("expected %q to be invalid", v)
+		}
+	}
+}
+
+func TestResolveElevenLabsVoice(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"rachel", "21m00Tcm4TlvDq8ikWAM"},
+		{"RACHEL", "21m00Tcm4TlvDq8ikWAM"}, // preset lookup is case-insensitive
+		{"josh", "TxGEqnHWrfWFTfGW9XjX"},
+		{"custom-voice-id-123", "custom-voice-id-123"}, // unknown name passes through
+	}
+	for _, c := range cases {
+		if got := resolveElevenLabsVoice(c.in); got != c.want {
+			t.Errorf("resolveElevenLabsVoice(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestResolveDeepgramVoice(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"asteria", "aura-asteria-en"},
+		{"ASTERIA", "aura-asteria-en"},
+		{"thalia", "aura-2-thalia-en"},
+		{"aura-custom-en", "aura-custom-en"}, // full model name passes through
+	}
+	for _, c := range cases {
+		if got := resolveDeepgramVoice(c.in); got != c.want {
+			t.Errorf("resolveDeepgramVoice(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
