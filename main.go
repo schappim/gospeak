@@ -123,7 +123,22 @@ type ElevenLabsVoiceSettings struct {
 	Speed           float64 `json:"speed,omitempty"`
 }
 
+// playAudioFn is wired through a package var so tests can substitute a no-op
+// implementation without driving the real audio device.
+var playAudioFn = playAudio
+
 func main() {
+	var stdin io.Reader = strings.NewReader("")
+	if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
+		stdin = os.Stdin
+	}
+	os.Exit(run(os.Args[1:], stdin, os.Stderr, os.Getenv))
+}
+
+// run is the testable entry point. It returns an exit code instead of calling
+// os.Exit so tests can drive the CLI without killing the process. Stdin,
+// stderr, and the env lookup are all injected for the same reason.
+func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) string) int {
 	var (
 		provider        string
 		voice           string
@@ -138,88 +153,91 @@ func main() {
 		similarityBoost float64
 	)
 
-	flag.StringVar(&provider, "provider", defaultProvider, "TTS provider (openai, elevenlabs, deepgram)")
-	flag.StringVar(&provider, "p", defaultProvider, "TTS provider (shorthand)")
-	flag.StringVar(&voice, "voice", "", "Voice to use (see --help for options)")
-	flag.StringVar(&voice, "v", "", "Voice to use (shorthand)")
-	flag.StringVar(&model, "model", "", "Model to use")
-	flag.StringVar(&model, "m", "", "Model to use (shorthand)")
-	flag.StringVar(&output, "output", "", "Save audio to this file")
-	flag.StringVar(&output, "o", "", "Save audio to this file (shorthand)")
-	flag.Float64Var(&speed, "speed", defaultSpeed, "Speed of the voice")
-	flag.Float64Var(&speed, "x", defaultSpeed, "Speed of the voice (shorthand)")
-	flag.BoolVar(&speak, "speak", false, "Speak the text even when saving to a file")
-	flag.BoolVar(&speak, "s", false, "Speak the text (shorthand)")
-	flag.StringVar(&token, "token", "", "API key for the provider")
-	flag.BoolVar(&help, "help", false, "Show help")
-	flag.BoolVar(&help, "h", false, "Show help (shorthand)")
-	flag.BoolVar(&allFlag, "all", false, "Use all voices (OpenAI only)")
-	flag.Float64Var(&stability, "stability", 0.5, "Voice stability (ElevenLabs only, 0.0-1.0)")
-	flag.Float64Var(&similarityBoost, "similarity", 0.75, "Similarity boost (ElevenLabs only, 0.0-1.0)")
+	fs := flag.NewFlagSet("gospeak", flag.ContinueOnError)
+	fs.SetOutput(stderr)
 
-	flag.Usage = func() {
-		fmt.Fprintf(os.Stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS API\n\n")
-		fmt.Fprintf(os.Stderr, "Usage: gospeak [options] [text]\n")
-		fmt.Fprintf(os.Stderr, "       echo 'text' | gospeak [options]\n\n")
-		fmt.Fprintf(os.Stderr, "Options:\n")
-		fmt.Fprintf(os.Stderr, "  -p, --provider    TTS provider: openai, elevenlabs, deepgram (default: openai)\n")
-		fmt.Fprintf(os.Stderr, "  -v, --voice       Voice to use (see below for options)\n")
-		fmt.Fprintf(os.Stderr, "  -m, --model       Model to use\n")
-		fmt.Fprintf(os.Stderr, "  -o, --output      Save audio to this file\n")
-		fmt.Fprintf(os.Stderr, "  -x, --speed       Speed of the voice (default: 1.0)\n")
-		fmt.Fprintf(os.Stderr, "  -s, --speak       Speak the text even when saving to a file\n")
-		fmt.Fprintf(os.Stderr, "      --token       API key (or set env var)\n")
-		fmt.Fprintf(os.Stderr, "      --all         Speak with all voices (OpenAI only)\n")
-		fmt.Fprintf(os.Stderr, "      --stability   Voice stability, 0.0-1.0 (ElevenLabs only)\n")
-		fmt.Fprintf(os.Stderr, "      --similarity  Similarity boost, 0.0-1.0 (ElevenLabs only)\n")
-		fmt.Fprintf(os.Stderr, "  -h, --help        Show this help message\n\n")
+	fs.StringVar(&provider, "provider", defaultProvider, "TTS provider (openai, elevenlabs, deepgram)")
+	fs.StringVar(&provider, "p", defaultProvider, "TTS provider (shorthand)")
+	fs.StringVar(&voice, "voice", "", "Voice to use (see --help for options)")
+	fs.StringVar(&voice, "v", "", "Voice to use (shorthand)")
+	fs.StringVar(&model, "model", "", "Model to use")
+	fs.StringVar(&model, "m", "", "Model to use (shorthand)")
+	fs.StringVar(&output, "output", "", "Save audio to this file")
+	fs.StringVar(&output, "o", "", "Save audio to this file (shorthand)")
+	fs.Float64Var(&speed, "speed", defaultSpeed, "Speed of the voice")
+	fs.Float64Var(&speed, "x", defaultSpeed, "Speed of the voice (shorthand)")
+	fs.BoolVar(&speak, "speak", false, "Speak the text even when saving to a file")
+	fs.BoolVar(&speak, "s", false, "Speak the text (shorthand)")
+	fs.StringVar(&token, "token", "", "API key for the provider")
+	fs.BoolVar(&help, "help", false, "Show help")
+	fs.BoolVar(&help, "h", false, "Show help (shorthand)")
+	fs.BoolVar(&allFlag, "all", false, "Use all voices (OpenAI only)")
+	fs.Float64Var(&stability, "stability", 0.5, "Voice stability (ElevenLabs only, 0.0-1.0)")
+	fs.Float64Var(&similarityBoost, "similarity", 0.75, "Similarity boost (ElevenLabs only, 0.0-1.0)")
 
-		fmt.Fprintf(os.Stderr, "OpenAI:\n")
-		fmt.Fprintf(os.Stderr, "  Env var: OPENAI_API_KEY\n")
-		fmt.Fprintf(os.Stderr, "  Voices:  alloy, echo, fable, onyx, nova, shimmer\n")
-		fmt.Fprintf(os.Stderr, "  Models:  tts-1, tts-1-hd (default: tts-1-hd)\n")
-		fmt.Fprintf(os.Stderr, "  Speed:   0.25 to 4.0\n\n")
+	fs.Usage = func() {
+		fmt.Fprintf(stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS API\n\n")
+		fmt.Fprintf(stderr, "Usage: gospeak [options] [text]\n")
+		fmt.Fprintf(stderr, "       echo 'text' | gospeak [options]\n\n")
+		fmt.Fprintf(stderr, "Options:\n")
+		fmt.Fprintf(stderr, "  -p, --provider    TTS provider: openai, elevenlabs, deepgram (default: openai)\n")
+		fmt.Fprintf(stderr, "  -v, --voice       Voice to use (see below for options)\n")
+		fmt.Fprintf(stderr, "  -m, --model       Model to use\n")
+		fmt.Fprintf(stderr, "  -o, --output      Save audio to this file\n")
+		fmt.Fprintf(stderr, "  -x, --speed       Speed of the voice (default: 1.0)\n")
+		fmt.Fprintf(stderr, "  -s, --speak       Speak the text even when saving to a file\n")
+		fmt.Fprintf(stderr, "      --token       API key (or set env var)\n")
+		fmt.Fprintf(stderr, "      --all         Speak with all voices (OpenAI only)\n")
+		fmt.Fprintf(stderr, "      --stability   Voice stability, 0.0-1.0 (ElevenLabs only)\n")
+		fmt.Fprintf(stderr, "      --similarity  Similarity boost, 0.0-1.0 (ElevenLabs only)\n")
+		fmt.Fprintf(stderr, "  -h, --help        Show this help message\n\n")
 
-		fmt.Fprintf(os.Stderr, "ElevenLabs:\n")
-		fmt.Fprintf(os.Stderr, "  Env var: ELEVENLABS_API_KEY\n")
-		fmt.Fprintf(os.Stderr, "  Voices:  rachel, domi, bella, antoni, elli, josh, arnold,\n")
-		fmt.Fprintf(os.Stderr, "           adam, sam, george, charlie, emily, lily, michael\n")
-		fmt.Fprintf(os.Stderr, "           (or use a voice_id directly)\n")
-		fmt.Fprintf(os.Stderr, "  Models:  eleven_multilingual_v2 (default), eleven_turbo_v2_5,\n")
-		fmt.Fprintf(os.Stderr, "           eleven_turbo_v2, eleven_monolingual_v1\n")
-		fmt.Fprintf(os.Stderr, "  Speed:   0.7 to 1.2\n\n")
+		fmt.Fprintf(stderr, "OpenAI:\n")
+		fmt.Fprintf(stderr, "  Env var: OPENAI_API_KEY\n")
+		fmt.Fprintf(stderr, "  Voices:  alloy, echo, fable, onyx, nova, shimmer\n")
+		fmt.Fprintf(stderr, "  Models:  tts-1, tts-1-hd (default: tts-1-hd)\n")
+		fmt.Fprintf(stderr, "  Speed:   0.25 to 4.0\n\n")
 
-		fmt.Fprintf(os.Stderr, "Deepgram:\n")
-		fmt.Fprintf(os.Stderr, "  Env var: DEEPGRAM_API_KEY\n")
-		fmt.Fprintf(os.Stderr, "  Voices:  asteria (default), luna, stella, athena, hera, orion,\n")
-		fmt.Fprintf(os.Stderr, "           arcas, perseus, angus, orpheus, helios, zeus\n")
-		fmt.Fprintf(os.Stderr, "           Aura 2: thalia, andromeda, helena, jason, apollo, ares\n")
-		fmt.Fprintf(os.Stderr, "           (or use a model name directly like aura-asteria-en)\n")
-		fmt.Fprintf(os.Stderr, "  Note:    Speed adjustment not supported\n\n")
+		fmt.Fprintf(stderr, "ElevenLabs:\n")
+		fmt.Fprintf(stderr, "  Env var: ELEVENLABS_API_KEY\n")
+		fmt.Fprintf(stderr, "  Voices:  rachel, domi, bella, antoni, elli, josh, arnold,\n")
+		fmt.Fprintf(stderr, "           adam, sam, george, charlie, emily, lily, michael\n")
+		fmt.Fprintf(stderr, "           (or use a voice_id directly)\n")
+		fmt.Fprintf(stderr, "  Models:  eleven_multilingual_v2 (default), eleven_turbo_v2_5,\n")
+		fmt.Fprintf(stderr, "           eleven_turbo_v2, eleven_monolingual_v1\n")
+		fmt.Fprintf(stderr, "  Speed:   0.7 to 1.2\n\n")
 
-		fmt.Fprintf(os.Stderr, "Examples:\n")
-		fmt.Fprintf(os.Stderr, "  gospeak \"Hello, world!\"\n")
-		fmt.Fprintf(os.Stderr, "  gospeak -p elevenlabs -v rachel \"Hello from ElevenLabs\"\n")
-		fmt.Fprintf(os.Stderr, "  gospeak -p deepgram -v asteria \"Hello from Deepgram\"\n")
-		fmt.Fprintf(os.Stderr, "  echo \"Hello\" | gospeak -v nova\n")
-		fmt.Fprintf(os.Stderr, "  gospeak -o output.mp3 \"Save this to a file\"\n")
+		fmt.Fprintf(stderr, "Deepgram:\n")
+		fmt.Fprintf(stderr, "  Env var: DEEPGRAM_API_KEY\n")
+		fmt.Fprintf(stderr, "  Voices:  asteria (default), luna, stella, athena, hera, orion,\n")
+		fmt.Fprintf(stderr, "           arcas, perseus, angus, orpheus, helios, zeus\n")
+		fmt.Fprintf(stderr, "           Aura 2: thalia, andromeda, helena, jason, apollo, ares\n")
+		fmt.Fprintf(stderr, "           (or use a model name directly like aura-asteria-en)\n")
+		fmt.Fprintf(stderr, "  Note:    Speed adjustment not supported\n\n")
+
+		fmt.Fprintf(stderr, "Examples:\n")
+		fmt.Fprintf(stderr, "  gospeak \"Hello, world!\"\n")
+		fmt.Fprintf(stderr, "  gospeak -p elevenlabs -v rachel \"Hello from ElevenLabs\"\n")
+		fmt.Fprintf(stderr, "  gospeak -p deepgram -v asteria \"Hello from Deepgram\"\n")
+		fmt.Fprintf(stderr, "  echo \"Hello\" | gospeak -v nova\n")
+		fmt.Fprintf(stderr, "  gospeak -o output.mp3 \"Save this to a file\"\n")
 	}
 
-	flag.Parse()
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
 
 	if help {
-		flag.Usage()
-		os.Exit(0)
+		fs.Usage()
+		return 0
 	}
 
-	// Normalize provider
 	provider = strings.ToLower(provider)
 	if provider != "openai" && provider != "elevenlabs" && provider != "deepgram" {
-		fmt.Fprintf(os.Stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', or 'deepgram'\n", provider)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', or 'deepgram'\n", provider)
+		return 1
 	}
 
-	// Set defaults based on provider
 	if voice == "" {
 		switch provider {
 		case "openai":
@@ -237,21 +255,19 @@ func main() {
 		case "elevenlabs":
 			model = defaultElevenLabsModel
 		case "deepgram":
-			// Deepgram uses voice as model, no separate model
 			model = ""
 		}
 	}
 
-	// Get API key
 	apiKey := token
 	if apiKey == "" {
 		switch provider {
 		case "openai":
-			apiKey = os.Getenv("OPENAI_API_KEY")
+			apiKey = getenv("OPENAI_API_KEY")
 		case "elevenlabs":
-			apiKey = os.Getenv("ELEVENLABS_API_KEY")
+			apiKey = getenv("ELEVENLABS_API_KEY")
 		case "deepgram":
-			apiKey = os.Getenv("DEEPGRAM_API_KEY")
+			apiKey = getenv("DEEPGRAM_API_KEY")
 		}
 	}
 	if apiKey == "" {
@@ -260,68 +276,61 @@ func main() {
 			"elevenlabs": "ELEVENLABS_API_KEY",
 			"deepgram":   "DEEPGRAM_API_KEY",
 		}
-		fmt.Fprintf(os.Stderr, "Error: %s environment variable not set and --token not provided\n", envVars[provider])
-		os.Exit(1)
+		fmt.Fprintf(stderr, "Error: %s environment variable not set and --token not provided\n", envVars[provider])
+		return 1
 	}
 
-	// Validate speed based on provider
 	switch provider {
 	case "openai":
 		if speed < 0.25 || speed > 4.0 {
-			fmt.Fprintln(os.Stderr, "Error: Speed must be between 0.25 and 4.0 for OpenAI")
-			os.Exit(1)
+			fmt.Fprintln(stderr, "Error: Speed must be between 0.25 and 4.0 for OpenAI")
+			return 1
 		}
 	case "elevenlabs":
 		if speed < 0.7 || speed > 1.2 {
-			fmt.Fprintln(os.Stderr, "Error: Speed must be between 0.7 and 1.2 for ElevenLabs")
-			os.Exit(1)
+			fmt.Fprintln(stderr, "Error: Speed must be between 0.7 and 1.2 for ElevenLabs")
+			return 1
 		}
 	case "deepgram":
 		if speed != defaultSpeed {
-			fmt.Fprintln(os.Stderr, "Warning: Speed adjustment is not supported for Deepgram, ignoring")
+			fmt.Fprintln(stderr, "Warning: Speed adjustment is not supported for Deepgram, ignoring")
 		}
 	}
 
-	// Get text input
 	var text string
-	if flag.NArg() > 0 {
-		text = strings.Join(flag.Args(), " ")
+	if fs.NArg() > 0 {
+		text = strings.Join(fs.Args(), " ")
 	} else {
-		// Read from stdin
-		stat, _ := os.Stdin.Stat()
-		if (stat.Mode() & os.ModeCharDevice) == 0 {
-			data, err := io.ReadAll(os.Stdin)
-			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error reading stdin: %v\n", err)
-				os.Exit(1)
-			}
-			text = strings.TrimSpace(string(data))
+		data, err := io.ReadAll(stdin)
+		if err != nil {
+			fmt.Fprintf(stderr, "Error reading stdin: %v\n", err)
+			return 1
 		}
+		text = strings.TrimSpace(string(data))
 	}
 
 	if text == "" {
-		fmt.Fprintln(os.Stderr, "Error: No text provided")
-		flag.Usage()
-		os.Exit(1)
+		fmt.Fprintln(stderr, "Error: No text provided")
+		fs.Usage()
+		return 1
 	}
 
-	// Handle --all flag (OpenAI only)
 	if allFlag {
 		if provider != "openai" {
-			fmt.Fprintln(os.Stderr, "Error: --all flag is only supported for OpenAI provider")
-			os.Exit(1)
+			fmt.Fprintln(stderr, "Error: --all flag is only supported for OpenAI provider")
+			return 1
 		}
 		for _, v := range openAIVoices {
-			fmt.Fprintf(os.Stderr, "Speaking with voice: %s\n", v)
+			fmt.Fprintf(stderr, "Speaking with voice: %s\n", v)
 			audioData, err := synthesizeChunked(v, func(chunk string) ([]byte, error) {
 				return synthesizeOpenAI(apiKey, model, v, chunk, speed)
 			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error synthesizing voice announcement: %v\n", err)
+				fmt.Fprintf(stderr, "Error synthesizing voice announcement: %v\n", err)
 				continue
 			}
-			if err := playAudio(audioData); err != nil {
-				fmt.Fprintf(os.Stderr, "Error playing audio: %v\n", err)
+			if err := playAudioFn(audioData); err != nil {
+				fmt.Fprintf(stderr, "Error playing audio: %v\n", err)
 				continue
 			}
 			time.Sleep(500 * time.Millisecond)
@@ -330,26 +339,25 @@ func main() {
 				return synthesizeOpenAI(apiKey, model, v, chunk, speed)
 			})
 			if err != nil {
-				fmt.Fprintf(os.Stderr, "Error synthesizing: %v\n", err)
+				fmt.Fprintf(stderr, "Error synthesizing: %v\n", err)
 				continue
 			}
-			if err := playAudio(audioData); err != nil {
-				fmt.Fprintf(os.Stderr, "Error playing audio: %v\n", err)
+			if err := playAudioFn(audioData); err != nil {
+				fmt.Fprintf(stderr, "Error playing audio: %v\n", err)
 			}
 			time.Sleep(1 * time.Second)
 		}
-		return
+		return 0
 	}
 
-	// Synthesize speech
 	var audioData []byte
 	var err error
 
 	switch provider {
 	case "openai":
 		if !isValidOpenAIVoice(voice) {
-			fmt.Fprintf(os.Stderr, "Error: Invalid OpenAI voice '%s'. Valid voices: %s\n", voice, strings.Join(openAIVoices, ", "))
-			os.Exit(1)
+			fmt.Fprintf(stderr, "Error: Invalid OpenAI voice '%s'. Valid voices: %s\n", voice, strings.Join(openAIVoices, ", "))
+			return 1
 		}
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeOpenAI(apiKey, model, voice, chunk, speed)
@@ -367,26 +375,26 @@ func main() {
 	}
 
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error synthesizing speech: %v\n", err)
-		os.Exit(1)
+		fmt.Fprintf(stderr, "Error synthesizing speech: %v\n", err)
+		return 1
 	}
 
-	// Save to file if requested
 	if output != "" {
 		if err := os.WriteFile(output, audioData, 0644); err != nil {
-			fmt.Fprintf(os.Stderr, "Error saving file: %v\n", err)
-			os.Exit(1)
+			fmt.Fprintf(stderr, "Error saving file: %v\n", err)
+			return 1
 		}
-		fmt.Fprintf(os.Stderr, "Saved to %s\n", output)
+		fmt.Fprintf(stderr, "Saved to %s\n", output)
 	}
 
-	// Play audio if no output file or if --speak flag is set
 	if output == "" || speak {
-		if err := playAudio(audioData); err != nil {
-			fmt.Fprintf(os.Stderr, "Error playing audio: %v\n", err)
-			os.Exit(1)
+		if err := playAudioFn(audioData); err != nil {
+			fmt.Fprintf(stderr, "Error playing audio: %v\n", err)
+			return 1
 		}
 	}
+
+	return 0
 }
 
 func isValidOpenAIVoice(voice string) bool {
