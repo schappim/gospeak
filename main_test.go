@@ -77,6 +77,40 @@ func TestChunkText_HardCutRespectsUTF8(t *testing.T) {
 	}
 }
 
+func TestChunkText_FallsBackToSingleNewline(t *testing.T) {
+	// No paragraph breaks, no sentence endings, no spaces near the boundary —
+	// just a single newline that the splitter should fall through to.
+	first := strings.Repeat("a", 80)
+	second := strings.Repeat("b", 80)
+	chunks := chunkText(first+"\n"+second, 100)
+	if len(chunks) != 2 || chunks[0] != first || chunks[1] != second {
+		t.Fatalf("expected split on single newline, got %#v", chunks)
+	}
+}
+
+func TestChunkText_HardCutFallsBackToMaxSizeWhenAllBytesAreContinuations(t *testing.T) {
+	// Synthetic pathological input: a long run with no break points and a hard
+	// cut position that lands inside a multibyte char. The rewind loop walks
+	// back, hits zero, then resets to maxSize so progress is made. The chunks
+	// won't be valid UTF-8 (the input isn't either) but the function must
+	// still terminate and produce chunks bounded by maxSize.
+	text := strings.Repeat("\x80", 300) // every byte is a UTF-8 continuation byte
+	chunks := chunkText(text, 50)
+	if len(chunks) == 0 {
+		t.Fatal("expected at least one chunk")
+	}
+	total := 0
+	for i, c := range chunks {
+		if len(c) > 50 {
+			t.Fatalf("chunk %d exceeds maxSize: %d bytes", i, len(c))
+		}
+		total += len(c)
+	}
+	if total == 0 {
+		t.Fatal("expected nonzero total chunk bytes")
+	}
+}
+
 func isValidUTF8(s string) bool {
 	for _, r := range s {
 		if r == '�' && len(s) > 0 {
