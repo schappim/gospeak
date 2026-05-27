@@ -1032,6 +1032,147 @@ func TestRun_AllFlagIteratesOpenAIVoices(t *testing.T) {
 	}
 }
 
+type failingReader struct{ err error }
+
+func (r failingReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestRun_StdinReadFailureReturnsError(t *testing.T) {
+	var stderr bytes.Buffer
+	code := run(nil, failingReader{err: errors.New("pipe broken")},
+		&stderr, envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr.String(), "Error reading stdin") ||
+		!strings.Contains(stderr.String(), "pipe broken") {
+		t.Fatalf("expected wrapped stdin error, got %q", stderr.String())
+	}
+}
+
+func TestRun_AllFlagContinuesAfterAnnouncementSynthError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+	defer swapBackoff(time.Millisecond)()
+	defer stubAudioReturning(nil)()
+	originalSleep := allVoiceSleep
+	allVoiceSleep = func(time.Duration) {}
+	defer func() { allVoiceSleep = originalSleep }()
+
+	code, stderr := runCLI(t, []string{"--all", "hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0 (--all should soldier on)", code)
+	}
+	// Every voice should have produced a synthesis error line.
+	count := strings.Count(stderr, "Error synthesizing voice announcement")
+	if count != len(openAIVoices) {
+		t.Fatalf("expected %d synth errors, got %d in %q", len(openAIVoices), count, stderr)
+	}
+}
+
+func TestRun_AllFlagContinuesAfterAnnouncementPlaybackError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+	defer stubAudioReturning(errors.New("no sink"))()
+	originalSleep := allVoiceSleep
+	allVoiceSleep = func(time.Duration) {}
+	defer func() { allVoiceSleep = originalSleep }()
+
+	code, stderr := runCLI(t, []string{"--all", "hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stderr, "no sink") {
+		t.Fatalf("expected playback error in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_AllFlagContinuesAfterTextStageErrors(t *testing.T) {
+	// Succeeds on announcement (Input matches a voice name), fails on text.
+	voices := map[string]bool{}
+	for _, v := range openAIVoices {
+		voices[v] = true
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body OpenAITTSRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		if voices[body.Input] {
+			_, _ = w.Write([]byte{0xFF, 0xFB})
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+	defer swapBackoff(time.Millisecond)()
+
+	// Announcement playback succeeds, text playback would too but the text
+	// stage fails at synth before playback is called.
+	defer stubAudioReturning(nil)()
+	originalSleep := allVoiceSleep
+	allVoiceSleep = func(time.Duration) {}
+	defer func() { allVoiceSleep = originalSleep }()
+
+	code, stderr := runCLI(t, []string{"--all", "hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	count := strings.Count(stderr, "Error synthesizing:")
+	if count != len(openAIVoices) {
+		t.Fatalf("expected %d text-synth errors, got %d in %q", len(openAIVoices), count, stderr)
+	}
+}
+
+func TestRun_AllFlagLogsButDoesNotExitOnTextPlaybackError(t *testing.T) {
+	// Announcement playback succeeds, text playback fails — the loop should
+	// log the error but fall through to the next voice without continue/exit.
+	var calls int
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	original := playAudioFn
+	// Odd calls (announcement) succeed; even calls (text) fail.
+	playAudioFn = func([]byte) error {
+		mu.Lock()
+		defer mu.Unlock()
+		calls++
+		if calls%2 == 0 {
+			return errors.New("text playback boom")
+		}
+		return nil
+	}
+	defer func() { playAudioFn = original }()
+
+	originalSleep := allVoiceSleep
+	allVoiceSleep = func(time.Duration) {}
+	defer func() { allVoiceSleep = originalSleep }()
+
+	code, stderr := runCLI(t, []string{"--all", "hi"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stderr, "text playback boom") {
+		t.Errorf("expected playback error to be logged, got %q", stderr)
+	}
+}
+
 func TestRun_AllFlagRejectsNonOpenAIProvider(t *testing.T) {
 	code, stderr := runCLI(t, []string{"--all", "-p", "deepgram", "hello"}, "", envMap(map[string]string{
 		"DEEPGRAM_API_KEY": "k",
