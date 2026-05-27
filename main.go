@@ -666,13 +666,27 @@ func synthesizeDeepgram(apiKey, voiceModel, text string) ([]byte, error) {
 }
 
 func playAudio(audioData []byte) error {
-	// Decode MP3
+	decoder, err := decodeMP3(audioData)
+	if err != nil {
+		return err
+	}
+	return playDecoded(decoder)
+}
+
+// decodeMP3 wraps mp3.NewDecoder so the decode step can be unit-tested without
+// touching the system audio device.
+func decodeMP3(audioData []byte) (*mp3.Decoder, error) {
 	decoder, err := mp3.NewDecoder(bytes.NewReader(audioData))
 	if err != nil {
-		return fmt.Errorf("failed to decode MP3: %w", err)
+		return nil, fmt.Errorf("failed to decode MP3: %w", err)
 	}
+	return decoder, nil
+}
 
-	// Create oto context
+// playDecoded drives the decoded PCM stream to the system audio device. Lives
+// behind its own symbol so playAudio's pre-playback failure path stays testable
+// even on machines without an audio device.
+func playDecoded(decoder *mp3.Decoder) error {
 	op := &oto.NewContextOptions{
 		SampleRate:   decoder.SampleRate(),
 		ChannelCount: 2,
@@ -685,18 +699,15 @@ func playAudio(audioData []byte) error {
 	}
 	<-readyChan
 
-	// Create player and play
 	player := otoCtx.NewPlayer(decoder)
 	defer player.Close()
 
 	player.Play()
 
-	// Wait for playback to finish
 	for player.IsPlaying() {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// Allow audio buffer to fully drain
 	time.Sleep(1 * time.Second)
 
 	return nil

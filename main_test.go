@@ -1,11 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -637,6 +639,63 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+func TestDecodeMP3_RejectsGarbage(t *testing.T) {
+	_, err := decodeMP3([]byte("not an mp3 stream"))
+	if err == nil {
+		t.Fatal("expected error decoding garbage as MP3")
+	}
+	if !strings.Contains(err.Error(), "failed to decode MP3") {
+		t.Fatalf("expected wrapped decode error, got %v", err)
+	}
+}
+
+func TestDecodeMP3_AcceptsValidStream(t *testing.T) {
+	mp3 := silentMP3OrSkip(t)
+	dec, err := decodeMP3(mp3)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if dec.SampleRate() <= 0 {
+		t.Fatalf("expected positive sample rate, got %d", dec.SampleRate())
+	}
+}
+
+func TestPlayAudio_ReturnsDecodeErrorBeforeTouchingAudioDevice(t *testing.T) {
+	// Garbage input must fail at decode, so this test doesn't depend on a
+	// working system audio device — useful for CI runners with no sink.
+	err := playAudio([]byte{0x00, 0x01, 0x02, 0x03})
+	if err == nil {
+		t.Fatal("expected error from garbage MP3")
+	}
+	if !strings.Contains(err.Error(), "failed to decode MP3") {
+		t.Fatalf("expected decode-stage error, got %v", err)
+	}
+}
+
+// silentMP3OrSkip generates a short silent MP3 with ffmpeg so tests that need
+// a valid MP3 byte stream can run without bundling a binary fixture or hitting
+// a TTS provider. Skips the test if ffmpeg isn't available.
+func silentMP3OrSkip(t *testing.T) []byte {
+	t.Helper()
+	if _, err := exec.LookPath("ffmpeg"); err != nil {
+		t.Skipf("ffmpeg not in PATH: %v", err)
+	}
+	cmd := exec.Command("ffmpeg",
+		"-hide_banner", "-loglevel", "error",
+		"-f", "lavfi", "-i", "anullsrc=channel_layout=mono:sample_rate=22050",
+		"-t", "0.1", "-f", "mp3", "-y", "pipe:1")
+	var out, errBuf bytes.Buffer
+	cmd.Stdout = &out
+	cmd.Stderr = &errBuf
+	if err := cmd.Run(); err != nil {
+		t.Skipf("ffmpeg failed to generate silent fixture: %v: %s", err, errBuf.String())
+	}
+	if out.Len() == 0 {
+		t.Skip("ffmpeg produced empty fixture")
+	}
+	return out.Bytes()
 }
 
 func bytesHasPrefix(b, prefix []byte) bool {
