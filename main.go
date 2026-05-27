@@ -400,6 +400,75 @@ func resolveDeepgramVoice(voice string) string {
 	return voice
 }
 
+// chunkText splits text into chunks no larger than maxSize bytes, preferring
+// to break on paragraph, sentence, line, then word boundaries. Falls back to a
+// UTF-8-safe hard cut when no natural boundary is found in the latter half of
+// the window.
+func chunkText(text string, maxSize int) []string {
+	text = strings.TrimSpace(text)
+	if len(text) <= maxSize {
+		if text == "" {
+			return nil
+		}
+		return []string{text}
+	}
+
+	var chunks []string
+	remaining := text
+	minSplit := maxSize / 2
+
+	for len(remaining) > maxSize {
+		window := remaining[:maxSize]
+		splitAt := -1
+
+		// 1. Paragraph break.
+		if idx := strings.LastIndex(window, "\n\n"); idx >= minSplit {
+			splitAt = idx + 2
+		}
+		// 2. Sentence end followed by whitespace.
+		if splitAt == -1 {
+			for _, sep := range []string{". ", "! ", "? ", ".\n", "!\n", "?\n"} {
+				if idx := strings.LastIndex(window, sep); idx >= minSplit && idx+len(sep) > splitAt {
+					splitAt = idx + len(sep)
+				}
+			}
+		}
+		// 3. Single newline.
+		if splitAt == -1 {
+			if idx := strings.LastIndex(window, "\n"); idx >= minSplit {
+				splitAt = idx + 1
+			}
+		}
+		// 4. Word boundary.
+		if splitAt == -1 {
+			if idx := strings.LastIndex(window, " "); idx >= minSplit {
+				splitAt = idx + 1
+			}
+		}
+		// 5. Hard cut, rewound to a UTF-8 codepoint boundary.
+		if splitAt == -1 {
+			splitAt = maxSize
+			for splitAt > 0 && remaining[splitAt]&0xC0 == 0x80 {
+				splitAt--
+			}
+			if splitAt == 0 {
+				splitAt = maxSize
+			}
+		}
+
+		chunk := strings.TrimSpace(remaining[:splitAt])
+		if chunk != "" {
+			chunks = append(chunks, chunk)
+		}
+		remaining = strings.TrimSpace(remaining[splitAt:])
+	}
+
+	if remaining != "" {
+		chunks = append(chunks, remaining)
+	}
+	return chunks
+}
+
 // withRetry retries fn up to maxRetries times with exponential backoff.
 // The label is used for log messages so the user can see which chunk is retrying.
 func withRetry(label string, fn func() ([]byte, error)) ([]byte, error) {
