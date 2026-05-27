@@ -19,16 +19,13 @@ const (
 	// OpenAI defaults
 	defaultOpenAIVoice = "alloy"
 	defaultOpenAIModel = "tts-1-hd"
-	openAIAPIURL       = "https://api.openai.com/v1/audio/speech"
 
 	// ElevenLabs defaults
 	defaultElevenLabsVoice = "rachel"
 	defaultElevenLabsModel = "eleven_multilingual_v2"
-	elevenLabsAPIURL       = "https://api.elevenlabs.io/v1/text-to-speech"
 
 	// Deepgram defaults
 	defaultDeepgramVoice = "aura-asteria-en"
-	deepgramAPIURL       = "https://api.deepgram.com/v1/speak"
 
 	defaultSpeed    = 1.0
 	defaultProvider = "openai"
@@ -45,6 +42,14 @@ const (
 // Initial backoff between retries (doubled each attempt). Declared as a var
 // rather than a const so tests can swap it in for fast-running retry tests.
 var initialBackoff = 1 * time.Second
+
+// Provider endpoint URLs. Declared as vars so tests can repoint them at an
+// httptest server without touching the calling code.
+var (
+	openAIAPIURL     = "https://api.openai.com/v1/audio/speech"
+	elevenLabsAPIURL = "https://api.elevenlabs.io/v1/text-to-speech"
+	deepgramAPIURL   = "https://api.deepgram.com/v1/speak"
+)
 
 var openAIVoices = []string{"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
 

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -298,6 +302,85 @@ func TestSynthesizeChunked_EmptyInputReturnsError(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected error for empty input")
 	}
+}
+
+func TestSynthesizeOpenAI_SendsExpectedRequest(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 0x90, 0x44, 'O', 'P', 'E', 'N'}
+
+	var captured struct {
+		method, path, auth, contentType string
+		body                            OpenAITTSRequest
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured.method = r.Method
+		captured.path = r.URL.Path
+		captured.auth = r.Header.Get("Authorization")
+		captured.contentType = r.Header.Get("Content-Type")
+		_ = json.NewDecoder(r.Body).Decode(&captured.body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	got, err := synthesizeOpenAI("sk-test", "tts-1-hd", "alloy", "hello", 1.25)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytesEqual(got, wantAudio) {
+		t.Fatalf("audio mismatch: got %x, want %x", got, wantAudio)
+	}
+	if captured.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", captured.method)
+	}
+	if captured.auth != "Bearer sk-test" {
+		t.Errorf("auth = %q, want %q", captured.auth, "Bearer sk-test")
+	}
+	if captured.contentType != "application/json" {
+		t.Errorf("content-type = %q", captured.contentType)
+	}
+	if captured.body.Model != "tts-1-hd" || captured.body.Voice != "alloy" ||
+		captured.body.Input != "hello" || captured.body.Speed != 1.25 ||
+		captured.body.ResponseFormat != "mp3" {
+		t.Errorf("body mismatch: %+v", captured.body)
+	}
+}
+
+func TestSynthesizeOpenAI_ReturnsErrorOnNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"bad key"}`)
+	}))
+	defer server.Close()
+
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	_, err := synthesizeOpenAI("sk-bad", "tts-1", "alloy", "hello", 1.0)
+	if err == nil {
+		t.Fatal("expected error on 401 response")
+	}
+	if !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "bad key") {
+		t.Fatalf("expected status and body in error, got %v", err)
+	}
+}
+
+func swapURL(target *string, url string) func() {
+	original := *target
+	*target = url
+	return func() { *target = original }
+}
+
+func bytesEqual(a, b []byte) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
 }
 
 func bytesHasPrefix(b, prefix []byte) bool {
