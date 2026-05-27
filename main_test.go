@@ -674,6 +674,24 @@ func TestPlayAudio_ReturnsDecodeErrorBeforeTouchingAudioDevice(t *testing.T) {
 	}
 }
 
+func TestPlayAudio_PlaysSilentMP3EndToEnd(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping audio playback test in -short mode")
+	}
+	mp3 := silentMP3OrSkip(t)
+
+	err := playAudio(mp3)
+	if err != nil {
+		// On a headless CI host there's no audio sink. oto reports this as
+		// "failed to create audio context"; treat it as a skip rather than a
+		// hard failure so the suite is still useful in that environment.
+		if strings.Contains(err.Error(), "failed to create audio context") {
+			t.Skipf("no audio device available: %v", err)
+		}
+		t.Fatalf("playAudio returned unexpected error: %v", err)
+	}
+}
+
 // silentMP3OrSkip generates a short silent MP3 with ffmpeg so tests that need
 // a valid MP3 byte stream can run without bundling a binary fixture or hitting
 // a TTS provider. Skips the test if ffmpeg isn't available.
