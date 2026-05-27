@@ -1,0 +1,106 @@
+package main
+
+import (
+	"strings"
+	"testing"
+)
+
+func TestChunkText_ShortInputReturnsSingleChunk(t *testing.T) {
+	chunks := chunkText("Hello, world!", 100)
+	if len(chunks) != 1 || chunks[0] != "Hello, world!" {
+		t.Fatalf("expected single unchanged chunk, got %#v", chunks)
+	}
+}
+
+func TestChunkText_EmptyInputReturnsNothing(t *testing.T) {
+	if got := chunkText("   ", 100); got != nil {
+		t.Fatalf("expected nil for whitespace-only input, got %#v", got)
+	}
+}
+
+func TestChunkText_PrefersParagraphBoundary(t *testing.T) {
+	first := strings.Repeat("a", 80)
+	second := strings.Repeat("b", 80)
+	text := first + "\n\n" + second
+	chunks := chunkText(text, 100)
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d: %#v", len(chunks), chunks)
+	}
+	if chunks[0] != first || chunks[1] != second {
+		t.Fatalf("paragraphs were not preserved cleanly: %#v", chunks)
+	}
+}
+
+func TestChunkText_PrefersSentenceBoundary(t *testing.T) {
+	first := strings.Repeat("a", 60) + "."
+	second := strings.Repeat("b", 60) + "."
+	chunks := chunkText(first+" "+second, 80)
+	if len(chunks) != 2 {
+		t.Fatalf("expected 2 chunks, got %d: %#v", len(chunks), chunks)
+	}
+	if chunks[0] != first {
+		t.Fatalf("first chunk should end at sentence boundary, got %q", chunks[0])
+	}
+}
+
+func TestChunkText_FallsBackToWordBoundary(t *testing.T) {
+	long := strings.Repeat("word ", 40) // 200 chars, no sentence breaks
+	chunks := chunkText(strings.TrimSpace(long), 80)
+	if len(chunks) < 2 {
+		t.Fatalf("expected multiple chunks, got %d: %#v", len(chunks), chunks)
+	}
+	for _, c := range chunks {
+		if len(c) > 80 {
+			t.Fatalf("chunk exceeds max size: len=%d", len(c))
+		}
+		if strings.Contains(c, "wor ") || strings.HasSuffix(c, "wor") {
+			t.Fatalf("word was split mid-token: %q", c)
+		}
+	}
+}
+
+func TestChunkText_HardCutRespectsUTF8(t *testing.T) {
+	// Each "é" is 2 bytes; together with the surrounding ASCII the string
+	// is forced past maxSize with no natural break points.
+	text := strings.Repeat("é", 200)
+	chunks := chunkText(text, 50)
+	for i, c := range chunks {
+		if !isValidUTF8(c) {
+			t.Fatalf("chunk %d is not valid UTF-8: %q", i, c)
+		}
+	}
+}
+
+func isValidUTF8(s string) bool {
+	for _, r := range s {
+		if r == '�' && len(s) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func TestStripID3v2_NoTagIsUnchanged(t *testing.T) {
+	in := []byte{0xFF, 0xFB, 0x90, 0x44}
+	if got := stripID3v2(in); &got[0] != &in[0] || len(got) != len(in) {
+		t.Fatalf("expected unchanged slice when no ID3 tag is present")
+	}
+}
+
+func TestStripID3v2_RemovesLeadingTag(t *testing.T) {
+	// ID3v2 header: "ID3" + version 03 00 + flags 00 + syncsafe size of 5.
+	header := []byte{'I', 'D', '3', 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05}
+	tagBody := []byte{1, 2, 3, 4, 5}
+	frames := []byte{0xFF, 0xFB, 0x90, 0x44}
+	in := append(append(header, tagBody...), frames...)
+
+	out := stripID3v2(in)
+	if len(out) != len(frames) {
+		t.Fatalf("expected tag stripped, got %d bytes (want %d)", len(out), len(frames))
+	}
+	for i, b := range frames {
+		if out[i] != b {
+			t.Fatalf("byte %d mismatch: got %x, want %x", i, out[i], b)
+		}
+	}
+}
