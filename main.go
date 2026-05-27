@@ -32,6 +32,17 @@ const (
 
 	defaultSpeed    = 1.0
 	defaultProvider = "openai"
+
+	// Maximum characters per TTS request before splitting into chunks.
+	// Sized to stay well under each provider's hard limit and to keep
+	// per-request latency comfortably under the HTTP client timeout.
+	maxChunkSize = 1500
+
+	// Number of attempts per chunk before giving up.
+	maxRetries = 3
+
+	// Initial backoff between retries (doubled each attempt).
+	initialBackoff = 1 * time.Second
 )
 
 var openAIVoices = []string{"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
@@ -387,6 +398,27 @@ func resolveDeepgramVoice(voice string) string {
 	}
 	// Otherwise assume it's a full model name (e.g., aura-asteria-en)
 	return voice
+}
+
+// withRetry retries fn up to maxRetries times with exponential backoff.
+// The label is used for log messages so the user can see which chunk is retrying.
+func withRetry(label string, fn func() ([]byte, error)) ([]byte, error) {
+	var lastErr error
+	backoff := initialBackoff
+	for attempt := 1; attempt <= maxRetries; attempt++ {
+		data, err := fn()
+		if err == nil {
+			return data, nil
+		}
+		lastErr = err
+		if attempt < maxRetries {
+			fmt.Fprintf(os.Stderr, "%s: attempt %d/%d failed: %v (retrying in %v)\n",
+				label, attempt, maxRetries, err, backoff)
+			time.Sleep(backoff)
+			backoff *= 2
+		}
+	}
+	return nil, fmt.Errorf("%s failed after %d attempts: %w", label, maxRetries, lastErr)
 }
 
 func synthesizeOpenAI(apiKey, model, voice, text string, speed float64) ([]byte, error) {
