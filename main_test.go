@@ -434,6 +434,66 @@ func TestSynthesizeElevenLabs_ReturnsErrorOnNon200(t *testing.T) {
 	}
 }
 
+func TestSynthesizeDeepgram_SendsExpectedRequest(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 0x90, 0x44, 'D', 'G'}
+
+	var captured struct {
+		method, auth, query string
+		body                DeepgramTTSRequest
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured.method = r.Method
+		captured.auth = r.Header.Get("Authorization")
+		captured.query = r.URL.RawQuery
+		_ = json.NewDecoder(r.Body).Decode(&captured.body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+
+	defer swapURL(&deepgramAPIURL, server.URL)()
+
+	got, err := synthesizeDeepgram("dg-test", "aura-asteria-en", "hello deepgram")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytesEqual(got, wantAudio) {
+		t.Fatalf("audio mismatch: got %x, want %x", got, wantAudio)
+	}
+	if captured.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", captured.method)
+	}
+	if captured.auth != "Token dg-test" {
+		t.Errorf("auth = %q, want %q", captured.auth, "Token dg-test")
+	}
+	if !strings.Contains(captured.query, "model=aura-asteria-en") {
+		t.Errorf("model not in query: %q", captured.query)
+	}
+	if !strings.Contains(captured.query, "encoding=mp3") {
+		t.Errorf("encoding not in query: %q", captured.query)
+	}
+	if captured.body.Text != "hello deepgram" {
+		t.Errorf("body text = %q, want %q", captured.body.Text, "hello deepgram")
+	}
+}
+
+func TestSynthesizeDeepgram_ReturnsErrorOnNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, `{"err":"upstream"}`)
+	}))
+	defer server.Close()
+	defer swapURL(&deepgramAPIURL, server.URL)()
+
+	_, err := synthesizeDeepgram("dg", "aura-asteria-en", "hi")
+	if err == nil {
+		t.Fatal("expected error on 500")
+	}
+	if !strings.Contains(err.Error(), "500") || !strings.Contains(err.Error(), "upstream") {
+		t.Fatalf("expected status and body in error, got %v", err)
+	}
+}
+
 func swapURL(target *string, url string) func() {
 	original := *target
 	*target = url
