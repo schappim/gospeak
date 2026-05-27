@@ -512,6 +512,34 @@ func TestSynthesizeDeepgram_FailsOnUnreachable(t *testing.T) {
 	assertNetworkError(t, err)
 }
 
+func TestSynthesizeOpenAI_FailsOnMalformedURL(t *testing.T) {
+	defer swapURL(&openAIAPIURL, "://no-scheme")()
+	_, err := synthesizeOpenAI("sk", "tts-1", "alloy", "hi", 1.0)
+	assertRequestBuildError(t, err)
+}
+
+func TestSynthesizeElevenLabs_FailsOnMalformedURL(t *testing.T) {
+	defer swapURL(&elevenLabsAPIURL, "://no-scheme")()
+	_, err := synthesizeElevenLabs("xi", "eleven_turbo_v2", "voice", "hi", 1.0, 0.5, 0.75)
+	assertRequestBuildError(t, err)
+}
+
+func TestSynthesizeDeepgram_FailsOnMalformedURL(t *testing.T) {
+	defer swapURL(&deepgramAPIURL, "://no-scheme")()
+	_, err := synthesizeDeepgram("dg", "aura-asteria-en", "hi")
+	assertRequestBuildError(t, err)
+}
+
+func assertRequestBuildError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected error from malformed URL")
+	}
+	if !strings.Contains(err.Error(), "failed to create request") {
+		t.Fatalf("expected wrapped http.NewRequest error, got %v", err)
+	}
+}
+
 // unreachableURL returns a URL that's guaranteed to refuse connections by
 // starting a server, taking its URL, then closing it.
 func unreachableURL(t *testing.T) string {
