@@ -127,6 +127,33 @@ func TestStripID3v2_NoTagIsUnchanged(t *testing.T) {
 	}
 }
 
+func TestStripID3v2_LeavesTruncatedTagAlone(t *testing.T) {
+	// Header claims a 100-byte body but only 3 trailing bytes are present.
+	// stripID3v2 must refuse to slice past the buffer and return the input
+	// unchanged so callers get something safe to write to the joined stream.
+	header := []byte{'I', 'D', '3', 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x64}
+	in := append(header, 0x01, 0x02, 0x03)
+
+	out := stripID3v2(in)
+	if len(out) != len(in) {
+		t.Fatalf("expected unchanged slice for truncated tag, got %d bytes", len(out))
+	}
+	for i, b := range in {
+		if out[i] != b {
+			t.Fatalf("byte %d mismatch: got %x, want %x", i, out[i], b)
+		}
+	}
+}
+
+func TestStripID3v2_LeavesShortBufferAlone(t *testing.T) {
+	// Anything shorter than the 10-byte header can't possibly be a tag.
+	in := []byte{'I', 'D', '3', 0x03}
+	out := stripID3v2(in)
+	if len(out) != len(in) {
+		t.Fatalf("expected unchanged slice for too-short buffer, got %d bytes", len(out))
+	}
+}
+
 func TestStripID3v2_RemovesLeadingTag(t *testing.T) {
 	// ID3v2 header: "ID3" + version 03 00 + flags 00 + syncsafe size of 5.
 	header := []byte{'I', 'D', '3', 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05}
