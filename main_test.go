@@ -676,6 +676,157 @@ func TestPlayAudio_ReturnsDecodeErrorBeforeTouchingAudioDevice(t *testing.T) {
 	}
 }
 
+// emptyEnv simulates no environment variables being set.
+func emptyEnv(string) string { return "" }
+
+// envMap returns a getenv function that looks up keys in the given map.
+func envMap(m map[string]string) func(string) string {
+	return func(k string) string { return m[k] }
+}
+
+func runCLI(t *testing.T, args []string, stdin string, getenv func(string) string) (int, string) {
+	t.Helper()
+	var stderr bytes.Buffer
+	code := run(args, strings.NewReader(stdin), &stderr, getenv)
+	return code, stderr.String()
+}
+
+func TestRun_HelpReturnsZeroAndPrintsUsage(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--help"}, "", emptyEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if !strings.Contains(stderr, "gospeak - Text-to-speech") {
+		t.Errorf("expected usage banner in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_InvalidFlagReturnsTwo(t *testing.T) {
+	code, _ := runCLI(t, []string{"--nope"}, "", emptyEnv)
+	if code != 2 {
+		t.Fatalf("exit code = %d, want 2 (flag parse error)", code)
+	}
+}
+
+func TestRun_InvalidProviderReturnsOne(t *testing.T) {
+	code, stderr := runCLI(t, []string{"-p", "weird", "hello"}, "", emptyEnv)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "Invalid provider 'weird'") {
+		t.Errorf("expected provider error in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_MissingAPIKeyPerProvider(t *testing.T) {
+	cases := []struct {
+		provider, env string
+	}{
+		{"openai", "OPENAI_API_KEY"},
+		{"elevenlabs", "ELEVENLABS_API_KEY"},
+		{"deepgram", "DEEPGRAM_API_KEY"},
+	}
+	for _, c := range cases {
+		t.Run(c.provider, func(t *testing.T) {
+			code, stderr := runCLI(t, []string{"-p", c.provider, "hello"}, "", emptyEnv)
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1", code)
+			}
+			if !strings.Contains(stderr, c.env) {
+				t.Errorf("expected %s in error message, got %q", c.env, stderr)
+			}
+		})
+	}
+}
+
+func TestRun_SpeedOutOfRangePerProvider(t *testing.T) {
+	cases := []struct {
+		name, provider string
+		speed          string
+		wantErr        string
+	}{
+		{"openai too slow", "openai", "0.1", "0.25 and 4.0"},
+		{"openai too fast", "openai", "5.0", "0.25 and 4.0"},
+		{"elevenlabs too slow", "elevenlabs", "0.5", "0.7 and 1.2"},
+		{"elevenlabs too fast", "elevenlabs", "1.5", "0.7 and 1.2"},
+	}
+	env := envMap(map[string]string{
+		"OPENAI_API_KEY":     "k",
+		"ELEVENLABS_API_KEY": "k",
+	})
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, stderr := runCLI(t, []string{"-p", c.provider, "-x", c.speed, "hello"}, "", env)
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1", code)
+			}
+			if !strings.Contains(stderr, c.wantErr) {
+				t.Errorf("expected %q in stderr, got %q", c.wantErr, stderr)
+			}
+		})
+	}
+}
+
+func TestRun_DeepgramSpeedWarnsButContinues(t *testing.T) {
+	// Deepgram doesn't support speed adjustment but doesn't exit; the warning
+	// should be on stderr while the rest of the pipeline proceeds. Pair this
+	// with -o and a stub server so we exercise the warning path without
+	// actually hitting a real API.
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB, 0x90, 0x44})
+	}))
+	defer server.Close()
+	defer swapURL(&deepgramAPIURL, server.URL)()
+
+	dir := t.TempDir()
+	out := dir + "/x.mp3"
+	code, stderr := runCLI(t, []string{
+		"-p", "deepgram", "-x", "1.5", "-o", out, "hi",
+	}, "", envMap(map[string]string{"DEEPGRAM_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "Speed adjustment is not supported") {
+		t.Errorf("expected speed warning in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_EmptyTextReturnsError(t *testing.T) {
+	code, stderr := runCLI(t, []string{"-p", "deepgram"}, "", envMap(map[string]string{
+		"DEEPGRAM_API_KEY": "k",
+	}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "No text provided") {
+		t.Errorf("expected empty-text error, got %q", stderr)
+	}
+}
+
+func TestRun_InvalidOpenAIVoiceReturnsError(t *testing.T) {
+	code, stderr := runCLI(t, []string{"-v", "not-a-voice", "hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "Invalid OpenAI voice 'not-a-voice'") {
+		t.Errorf("expected voice error, got %q", stderr)
+	}
+}
+
+func TestRun_AllFlagRejectsNonOpenAIProvider(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--all", "-p", "deepgram", "hello"}, "", envMap(map[string]string{
+		"DEEPGRAM_API_KEY": "k",
+	}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--all flag is only supported for OpenAI") {
+		t.Errorf("expected --all guard message, got %q", stderr)
+	}
+}
+
 func TestPlayDecoded_WrapsAudioContextError(t *testing.T) {
 	mp3 := silentMP3OrSkip(t)
 	dec, err := decodeMP3(mp3)
