@@ -198,6 +198,120 @@ func TestWithRetry_GivesUpAfterMaxAttempts(t *testing.T) {
 	}
 }
 
+func TestSynthesizeChunked_SingleChunkPassesThrough(t *testing.T) {
+	calls := 0
+	var lastChunk string
+	out, err := synthesizeChunked("short text", func(chunk string) ([]byte, error) {
+		calls++
+		lastChunk = chunk
+		return []byte("AUDIO"), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call, got %d", calls)
+	}
+	if lastChunk != "short text" {
+		t.Fatalf("expected unchanged text, got %q", lastChunk)
+	}
+	if string(out) != "AUDIO" {
+		t.Fatalf("expected payload %q, got %q", "AUDIO", string(out))
+	}
+}
+
+func TestSynthesizeChunked_JoinsMultipleChunks(t *testing.T) {
+	// Build text longer than maxChunkSize with paragraph breaks so it splits cleanly.
+	paragraph := strings.Repeat("a", 800)
+	text := paragraph + "\n\n" + paragraph + "\n\n" + paragraph
+	var calls int
+	out, err := synthesizeChunked(text, func(chunk string) ([]byte, error) {
+		calls++
+		return []byte("[" + chunk[:1] + "]"), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls < 2 {
+		t.Fatalf("expected multiple chunks, got %d call(s)", calls)
+	}
+	expected := strings.Repeat("[a]", calls)
+	if string(out) != expected {
+		t.Fatalf("expected joined payload %q, got %q", expected, string(out))
+	}
+}
+
+func TestSynthesizeChunked_StripsID3OnLaterChunks(t *testing.T) {
+	paragraph := strings.Repeat("b", 800)
+	text := paragraph + "\n\n" + paragraph
+
+	// ID3v2 header with a 5-byte body — every synth call returns one of these
+	// followed by distinct frame bytes so we can see what the joiner produced.
+	id3 := []byte{'I', 'D', '3', 0x03, 0x00, 0x00, 0x00, 0x00, 0x00, 0x05, 1, 2, 3, 4, 5}
+	frames := []byte{0xFF, 0xFB, 0x90, 0x44}
+
+	out, err := synthesizeChunked(text, func(chunk string) ([]byte, error) {
+		return append(append([]byte{}, id3...), frames...), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+
+	// First chunk keeps its ID3 block, every later chunk should be frames only.
+	wantPrefix := append(append([]byte{}, id3...), frames...)
+	if !bytesHasPrefix(out, wantPrefix) {
+		t.Fatalf("first chunk should keep its ID3 tag, got prefix %x", out[:len(wantPrefix)])
+	}
+	rest := out[len(wantPrefix):]
+	if len(rest)%len(frames) != 0 {
+		t.Fatalf("trailing bytes should be whole-frame multiples, got %d bytes", len(rest))
+	}
+	for i := 0; i < len(rest); i += len(frames) {
+		for j, b := range frames {
+			if rest[i+j] != b {
+				t.Fatalf("frame mismatch at offset %d: got %x, want %x", i+j, rest[i+j], b)
+			}
+		}
+	}
+}
+
+func TestSynthesizeChunked_PropagatesUpstreamError(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	paragraph := strings.Repeat("c", 800)
+	text := paragraph + "\n\n" + paragraph
+
+	wantErr := errors.New("provider boom")
+	_, err := synthesizeChunked(text, func(chunk string) ([]byte, error) {
+		return nil, wantErr
+	})
+	if err == nil || !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped %v, got %v", wantErr, err)
+	}
+}
+
+func TestSynthesizeChunked_EmptyInputReturnsError(t *testing.T) {
+	_, err := synthesizeChunked("   ", func(chunk string) ([]byte, error) {
+		t.Fatal("synth must not be called for empty input")
+		return nil, nil
+	})
+	if err == nil {
+		t.Fatal("expected error for empty input")
+	}
+}
+
+func bytesHasPrefix(b, prefix []byte) bool {
+	if len(b) < len(prefix) {
+		return false
+	}
+	for i, p := range prefix {
+		if b[i] != p {
+			return false
+		}
+	}
+	return true
+}
+
 // swapBackoff temporarily lowers the initial retry backoff so retry tests don't
 // burn real seconds. Returns a restore func meant to be deferred.
 func swapBackoff(d time.Duration) func() {
