@@ -678,6 +678,76 @@ func TestPlayAudio_ReturnsDecodeErrorBeforeTouchingAudioDevice(t *testing.T) {
 	}
 }
 
+// TestMain re-routes execution to main() when GOSPEAK_TEST_BINARY is set, so
+// subprocess tests below can exercise the real entry point with coverage.
+func TestMain(m *testing.M) {
+	if os.Getenv("GOSPEAK_TEST_BINARY") == "1" {
+		main()
+		return
+	}
+	os.Exit(m.Run())
+}
+
+func TestMainEntryPoint_NoArgsExitsOne(t *testing.T) {
+	cmd := exec.Command(os.Args[0])
+	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1", "OPENAI_API_KEY=")
+	cmd.Stdin = strings.NewReader("") // simulate no piped input
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v", err)
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1", exitErr.ExitCode())
+	}
+	// Either of these is acceptable: it could complain about the missing key
+	// (when OPENAI_API_KEY isn't set in the env) or about empty text.
+	if !strings.Contains(stderr.String(), "OPENAI_API_KEY") &&
+		!strings.Contains(stderr.String(), "No text provided") {
+		t.Fatalf("expected an actionable error, got %q", stderr.String())
+	}
+}
+
+func TestMainEntryPoint_HelpExitsZero(t *testing.T) {
+	cmd := exec.Command(os.Args[0], "--help")
+	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("expected exit 0 for --help, got %v: %s", err, stderr.String())
+	}
+	if !strings.Contains(stderr.String(), "gospeak - Text-to-speech") {
+		t.Fatal("expected usage banner in stderr")
+	}
+}
+
+func TestMainEntryPoint_PipedStdinReachesRun(t *testing.T) {
+	// Piping text in with no API key set should hit the missing-key branch
+	// through the real main() — exercises the os.Stdin.Stat non-character
+	// device branch that resolves stdin to the pipe.
+	cmd := exec.Command(os.Args[0], "-p", "openai")
+	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1", "OPENAI_API_KEY=")
+	cmd.Stdin = strings.NewReader("from a real pipe")
+	var stderr bytes.Buffer
+	cmd.Stderr = &stderr
+
+	err := cmd.Run()
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		t.Fatalf("expected exit error, got %v", err)
+	}
+	if exitErr.ExitCode() != 1 {
+		t.Fatalf("exit code = %d, want 1", exitErr.ExitCode())
+	}
+	if !strings.Contains(stderr.String(), "OPENAI_API_KEY") {
+		t.Fatalf("expected missing-key error, got %q", stderr.String())
+	}
+}
+
 // emptyEnv simulates no environment variables being set.
 func emptyEnv(string) string { return "" }
 
