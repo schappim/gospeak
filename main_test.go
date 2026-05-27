@@ -365,6 +365,75 @@ func TestSynthesizeOpenAI_ReturnsErrorOnNon200(t *testing.T) {
 	}
 }
 
+func TestSynthesizeElevenLabs_SendsExpectedRequest(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 0x90, 0x44, 'E', 'L'}
+
+	var captured struct {
+		method, path, key, query string
+		body                     ElevenLabsTTSRequest
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured.method = r.Method
+		captured.path = r.URL.Path
+		captured.query = r.URL.RawQuery
+		captured.key = r.Header.Get("xi-api-key")
+		_ = json.NewDecoder(r.Body).Decode(&captured.body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+
+	defer swapURL(&elevenLabsAPIURL, server.URL)()
+
+	got, err := synthesizeElevenLabs("xi-test", "eleven_multilingual_v2", "voice-xyz", "hi", 1.1, 0.6, 0.8)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytesEqual(got, wantAudio) {
+		t.Fatalf("audio mismatch: got %x, want %x", got, wantAudio)
+	}
+	if captured.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", captured.method)
+	}
+	if !strings.HasSuffix(captured.path, "/voice-xyz") {
+		t.Errorf("voice ID not in path: %q", captured.path)
+	}
+	if !strings.Contains(captured.query, "output_format=mp3_44100_128") {
+		t.Errorf("expected mp3 output_format query, got %q", captured.query)
+	}
+	if captured.key != "xi-test" {
+		t.Errorf("xi-api-key = %q", captured.key)
+	}
+	if captured.body.Text != "hi" || captured.body.ModelID != "eleven_multilingual_v2" {
+		t.Errorf("body mismatch: %+v", captured.body)
+	}
+	if captured.body.VoiceSettings == nil {
+		t.Fatal("voice settings missing")
+	}
+	if captured.body.VoiceSettings.Stability != 0.6 ||
+		captured.body.VoiceSettings.SimilarityBoost != 0.8 ||
+		captured.body.VoiceSettings.Speed != 1.1 {
+		t.Errorf("voice settings mismatch: %+v", *captured.body.VoiceSettings)
+	}
+}
+
+func TestSynthesizeElevenLabs_ReturnsErrorOnNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusBadRequest)
+		_, _ = io.WriteString(w, `{"detail":"quota"}`)
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsAPIURL, server.URL)()
+
+	_, err := synthesizeElevenLabs("xi", "eleven_turbo_v2", "voice", "hi", 1.0, 0.5, 0.75)
+	if err == nil {
+		t.Fatal("expected error on 400")
+	}
+	if !strings.Contains(err.Error(), "400") || !strings.Contains(err.Error(), "quota") {
+		t.Fatalf("expected status and body in error, got %v", err)
+	}
+}
+
 func swapURL(target *string, url string) func() {
 	original := *target
 	*target = url
