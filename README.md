@@ -6,6 +6,8 @@ A self-contained command-line tool for text-to-speech using OpenAI, ElevenLabs, 
 
 - **Multiple TTS providers**: OpenAI, ElevenLabs, and Deepgram
 - **No ffmpeg required** - uses native Go audio libraries
+- **Auto-chunking for long text** - splits on paragraph/sentence boundaries and joins the audio so multi-paragraph input never hits a per-request timeout
+- **Automatic retries** - up to 3 attempts per chunk with exponential backoff
 - Multiple voice options for each provider
 - Standard and HD quality models
 - Adjustable speech speed
@@ -273,6 +275,23 @@ llm "Tell me a fact" | gospeak -p deepgram -v asteria
 gospeak "Hello world"
 gospeak -p elevenlabs "Hello world"
 gospeak -p deepgram "Hello world"
+```
+
+## Long Text and Reliability
+
+Input longer than ~1500 characters is automatically split on paragraph,
+sentence, or word boundaries, synthesized chunk-by-chunk, and joined back into
+a single MP3 stream. Each chunk is retried up to 3 times with exponential
+backoff (1s, 2s, 4s) before the command gives up, so transient timeouts and
+upstream blips no longer require a manual rerun.
+
+Progress is reported on stderr:
+
+```
+Text is 4023 chars — splitting into 3 chunks
+Synthesizing chunk 1/3 (1492 chars)...
+Synthesizing chunk 2/3 (1487 chars)...
+Synthesizing chunk 3/3 (1044 chars)...
 ```
 
 ## Error Handling
