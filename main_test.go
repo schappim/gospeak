@@ -494,6 +494,44 @@ func TestSynthesizeDeepgram_ReturnsErrorOnNon200(t *testing.T) {
 	}
 }
 
+func TestSynthesizeOpenAI_FailsOnUnreachable(t *testing.T) {
+	defer swapURL(&openAIAPIURL, unreachableURL(t))()
+	_, err := synthesizeOpenAI("sk", "tts-1", "alloy", "hi", 1.0)
+	assertNetworkError(t, err)
+}
+
+func TestSynthesizeElevenLabs_FailsOnUnreachable(t *testing.T) {
+	defer swapURL(&elevenLabsAPIURL, unreachableURL(t))()
+	_, err := synthesizeElevenLabs("xi", "eleven_turbo_v2", "voice", "hi", 1.0, 0.5, 0.75)
+	assertNetworkError(t, err)
+}
+
+func TestSynthesizeDeepgram_FailsOnUnreachable(t *testing.T) {
+	defer swapURL(&deepgramAPIURL, unreachableURL(t))()
+	_, err := synthesizeDeepgram("dg", "aura-asteria-en", "hi")
+	assertNetworkError(t, err)
+}
+
+// unreachableURL returns a URL that's guaranteed to refuse connections by
+// starting a server, taking its URL, then closing it.
+func unreachableURL(t *testing.T) string {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	url := srv.URL
+	srv.Close()
+	return url
+}
+
+func assertNetworkError(t *testing.T, err error) {
+	t.Helper()
+	if err == nil {
+		t.Fatal("expected error from unreachable server")
+	}
+	if !strings.Contains(err.Error(), "failed to make request") {
+		t.Fatalf("expected wrapped client.Do error, got %v", err)
+	}
+}
+
 func swapURL(target *string, url string) func() {
 	original := *target
 	*target = url
