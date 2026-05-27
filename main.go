@@ -683,6 +683,10 @@ func decodeMP3(audioData []byte) (*mp3.Decoder, error) {
 	return decoder, nil
 }
 
+// newAudioContext is wired through a package var so tests can substitute a
+// fake that simulates a host with no audio device.
+var newAudioContext = oto.NewContext
+
 // playDecoded drives the decoded PCM stream to the system audio device. Lives
 // behind its own symbol so playAudio's pre-playback failure path stays testable
 // even on machines without an audio device.
@@ -693,7 +697,7 @@ func playDecoded(decoder *mp3.Decoder) error {
 		Format:       oto.FormatSignedInt16LE,
 	}
 
-	otoCtx, readyChan, err := oto.NewContext(op)
+	otoCtx, readyChan, err := newAudioContext(op)
 	if err != nil {
 		return fmt.Errorf("failed to create audio context: %w", err)
 	}

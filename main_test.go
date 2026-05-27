@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/ebitengine/oto/v3"
 )
 
 func TestChunkText_ShortInputReturnsSingleChunk(t *testing.T) {
@@ -671,6 +673,31 @@ func TestPlayAudio_ReturnsDecodeErrorBeforeTouchingAudioDevice(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "failed to decode MP3") {
 		t.Fatalf("expected decode-stage error, got %v", err)
+	}
+}
+
+func TestPlayDecoded_WrapsAudioContextError(t *testing.T) {
+	mp3 := silentMP3OrSkip(t)
+	dec, err := decodeMP3(mp3)
+	if err != nil {
+		t.Fatalf("unexpected decode error: %v", err)
+	}
+
+	original := newAudioContext
+	newAudioContext = func(*oto.NewContextOptions) (*oto.Context, chan struct{}, error) {
+		return nil, nil, errors.New("no audio sink")
+	}
+	defer func() { newAudioContext = original }()
+
+	err = playDecoded(dec)
+	if err == nil {
+		t.Fatal("expected error from injected audio context failure")
+	}
+	if !strings.Contains(err.Error(), "failed to create audio context") {
+		t.Fatalf("expected wrapped context error, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "no audio sink") {
+		t.Fatalf("expected underlying cause in error, got %v", err)
 	}
 }
 
