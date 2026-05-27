@@ -400,6 +400,22 @@ func resolveDeepgramVoice(voice string) string {
 	return voice
 }
 
+// stripID3v2 removes a leading ID3v2 tag from an MP3 byte slice if present.
+// Used to clean each chunk after the first so concatenated audio has at most
+// one tag block at the very start.
+func stripID3v2(data []byte) []byte {
+	if len(data) < 10 || data[0] != 'I' || data[1] != 'D' || data[2] != '3' {
+		return data
+	}
+	// The size field is a syncsafe integer: four bytes, each contributing 7 bits.
+	size := int(data[6]&0x7F)<<21 | int(data[7]&0x7F)<<14 | int(data[8]&0x7F)<<7 | int(data[9]&0x7F)
+	headerLen := 10 + size
+	if headerLen > len(data) {
+		return data
+	}
+	return data[headerLen:]
+}
+
 // chunkText splits text into chunks no larger than maxSize bytes, preferring
 // to break on paragraph, sentence, line, then word boundaries. Falls back to a
 // UTF-8-safe hard cut when no natural boundary is found in the latter half of
