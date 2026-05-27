@@ -127,6 +127,11 @@ type ElevenLabsVoiceSettings struct {
 // implementation without driving the real audio device.
 var playAudioFn = playAudio
 
+// allVoiceSleep is the delay used between the announcement and the text and
+// between consecutive voices in --all mode. Wired through a package var so
+// tests can collapse the wait without sacrificing the demo cadence in prod.
+var allVoiceSleep = time.Sleep
+
 func main() {
 	var stdin io.Reader = strings.NewReader("")
 	if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
@@ -333,7 +338,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 				fmt.Fprintf(stderr, "Error playing audio: %v\n", err)
 				continue
 			}
-			time.Sleep(500 * time.Millisecond)
+			allVoiceSleep(500 * time.Millisecond)
 
 			audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 				return synthesizeOpenAI(apiKey, model, v, chunk, speed)
@@ -345,7 +350,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			if err := playAudioFn(audioData); err != nil {
 				fmt.Fprintf(stderr, "Error playing audio: %v\n", err)
 			}
-			time.Sleep(1 * time.Second)
+			allVoiceSleep(1 * time.Second)
 		}
 		return 0
 	}

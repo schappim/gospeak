@@ -7,8 +7,10 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -812,6 +814,221 @@ func TestRun_InvalidOpenAIVoiceReturnsError(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "Invalid OpenAI voice 'not-a-voice'") {
 		t.Errorf("expected voice error, got %q", stderr)
+	}
+}
+
+// stubAudio captures calls to playAudioFn so tests can verify playback was
+// invoked without driving the real audio device. Returns a restore func.
+func stubAudio() (*[][]byte, func()) {
+	var captured [][]byte
+	original := playAudioFn
+	playAudioFn = func(b []byte) error {
+		captured = append(captured, append([]byte(nil), b...))
+		return nil
+	}
+	return &captured, func() { playAudioFn = original }
+}
+
+// stubAudioReturning installs a playAudioFn that returns the supplied error.
+func stubAudioReturning(err error) func() {
+	original := playAudioFn
+	playAudioFn = func([]byte) error { return err }
+	return func() { playAudioFn = original }
+}
+
+func TestRun_OpenAIHappyPathWritesFile(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 'O', 'A'}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	out := t.TempDir() + "/out.mp3"
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("output file not written: %v", err)
+	}
+	if !bytesEqual(got, wantAudio) {
+		t.Fatalf("file contents = %x, want %x", got, wantAudio)
+	}
+	if !strings.Contains(stderr, "Saved to "+out) {
+		t.Errorf("expected save confirmation in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_ElevenLabsHappyPathReadsStdin(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB, 'E', 'L'})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsAPIURL, server.URL)()
+
+	out := t.TempDir() + "/out.mp3"
+	code, stderr := runCLI(t, []string{"-p", "elevenlabs", "-o", out},
+		"  piped text  ",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Fatalf("expected output file, got %v", err)
+	}
+}
+
+func TestRun_PlaysAudioWhenNoOutputFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB, 'P', '1'})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	captured, restore := stubAudio()
+	defer restore()
+
+	code, stderr := runCLI(t, []string{"hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if len(*captured) != 1 {
+		t.Fatalf("expected 1 playback call, got %d", len(*captured))
+	}
+	if !bytesEqual((*captured)[0], []byte{0xFF, 0xFB, 'P', '1'}) {
+		t.Errorf("playback received wrong bytes: %x", (*captured)[0])
+	}
+}
+
+func TestRun_SpeakFlagPlaysEvenWhenSavingFile(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB, 'S', 'P'})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	captured, restore := stubAudio()
+	defer restore()
+
+	out := t.TempDir() + "/out.mp3"
+	code, _ := runCLI(t, []string{"-o", out, "-s", "hi"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if _, err := os.Stat(out); err != nil {
+		t.Errorf("expected file written, got %v", err)
+	}
+	if len(*captured) != 1 {
+		t.Errorf("expected playback even with -o when -s is set, got %d calls", len(*captured))
+	}
+}
+
+func TestRun_PlaybackFailureReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB, 'X', 'X'})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	defer stubAudioReturning(errors.New("no sink"))()
+
+	code, stderr := runCLI(t, []string{"hi"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "Error playing audio") || !strings.Contains(stderr, "no sink") {
+		t.Errorf("expected playback error in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_SynthFailureReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusInternalServerError)
+		_, _ = io.WriteString(w, "boom")
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+	defer swapBackoff(time.Millisecond)()
+
+	out := t.TempDir() + "/out.mp3"
+	code, stderr := runCLI(t, []string{"-o", out, "hi"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "Error synthesizing speech") {
+		t.Errorf("expected synth error in stderr, got %q", stderr)
+	}
+	if _, err := os.Stat(out); err == nil {
+		t.Error("expected no file written when synth fails")
+	}
+}
+
+func TestRun_FileWriteFailureReturnsError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB, 'W', 'R'})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	// A path under a non-existent directory cannot be written.
+	out := t.TempDir() + "/does-not-exist/out.mp3"
+	code, stderr := runCLI(t, []string{"-o", out, "hi"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "Error saving file") {
+		t.Errorf("expected save error in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_AllFlagIteratesOpenAIVoices(t *testing.T) {
+	var seen []string
+	var mu sync.Mutex
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body OpenAITTSRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		mu.Lock()
+		seen = append(seen, body.Voice)
+		mu.Unlock()
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+	defer stubAudioReturning(nil)()
+	originalSleep := allVoiceSleep
+	allVoiceSleep = func(time.Duration) {}
+	defer func() { allVoiceSleep = originalSleep }()
+
+	code, _ := runCLI(t, []string{"--all", "hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	// --all calls each voice twice (announcement + text), so we expect every
+	// canonical voice to appear at least once.
+	got := map[string]bool{}
+	for _, v := range seen {
+		got[v] = true
+	}
+	for _, v := range openAIVoices {
+		if !got[v] {
+			t.Errorf("expected --all to synthesize for voice %q", v)
+		}
 	}
 }
 
