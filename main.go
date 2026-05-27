@@ -307,7 +307,9 @@ func main() {
 		}
 		for _, v := range openAIVoices {
 			fmt.Fprintf(os.Stderr, "Speaking with voice: %s\n", v)
-			audioData, err := synthesizeOpenAI(apiKey, model, v, v, speed)
+			audioData, err := synthesizeChunked(v, func(chunk string) ([]byte, error) {
+				return synthesizeOpenAI(apiKey, model, v, chunk, speed)
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error synthesizing voice announcement: %v\n", err)
 				continue
@@ -318,7 +320,9 @@ func main() {
 			}
 			time.Sleep(500 * time.Millisecond)
 
-			audioData, err = synthesizeOpenAI(apiKey, model, v, text, speed)
+			audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
+				return synthesizeOpenAI(apiKey, model, v, chunk, speed)
+			})
 			if err != nil {
 				fmt.Fprintf(os.Stderr, "Error synthesizing: %v\n", err)
 				continue
@@ -341,13 +345,19 @@ func main() {
 			fmt.Fprintf(os.Stderr, "Error: Invalid OpenAI voice '%s'. Valid voices: %s\n", voice, strings.Join(openAIVoices, ", "))
 			os.Exit(1)
 		}
-		audioData, err = synthesizeOpenAI(apiKey, model, voice, text, speed)
+		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
+			return synthesizeOpenAI(apiKey, model, voice, chunk, speed)
+		})
 	case "elevenlabs":
 		voiceID := resolveElevenLabsVoice(voice)
-		audioData, err = synthesizeElevenLabs(apiKey, model, voiceID, text, speed, stability, similarityBoost)
+		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
+			return synthesizeElevenLabs(apiKey, model, voiceID, chunk, speed, stability, similarityBoost)
+		})
 	case "deepgram":
 		voiceModel := resolveDeepgramVoice(voice)
-		audioData, err = synthesizeDeepgram(apiKey, voiceModel, text)
+		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
+			return synthesizeDeepgram(apiKey, voiceModel, chunk)
+		})
 	}
 
 	if err != nil {
@@ -483,6 +493,38 @@ func chunkText(text string, maxSize int) []string {
 		chunks = append(chunks, remaining)
 	}
 	return chunks
+}
+
+// synthesizeChunked chunks long text, calls synth for each piece with retries,
+// and concatenates the resulting MP3 byte streams.
+func synthesizeChunked(text string, synth func(string) ([]byte, error)) ([]byte, error) {
+	chunks := chunkText(text, maxChunkSize)
+	if len(chunks) == 0 {
+		return nil, fmt.Errorf("no text to synthesize")
+	}
+	if len(chunks) == 1 {
+		return withRetry("synthesize", func() ([]byte, error) {
+			return synth(chunks[0])
+		})
+	}
+
+	fmt.Fprintf(os.Stderr, "Text is %d chars — splitting into %d chunks\n", len(text), len(chunks))
+	var combined []byte
+	for i, chunk := range chunks {
+		fmt.Fprintf(os.Stderr, "Synthesizing chunk %d/%d (%d chars)...\n", i+1, len(chunks), len(chunk))
+		label := fmt.Sprintf("chunk %d/%d", i+1, len(chunks))
+		data, err := withRetry(label, func() ([]byte, error) {
+			return synth(chunk)
+		})
+		if err != nil {
+			return nil, err
+		}
+		if i > 0 {
+			data = stripID3v2(data)
+		}
+		combined = append(combined, data...)
+	}
+	return combined, nil
 }
 
 // withRetry retries fn up to maxRetries times with exponential backoff.
