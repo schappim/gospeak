@@ -1,8 +1,10 @@
 package main
 
 import (
+	"errors"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestChunkText_ShortInputReturnsSingleChunk(t *testing.T) {
@@ -132,6 +134,76 @@ func TestResolveElevenLabsVoice(t *testing.T) {
 			t.Errorf("resolveElevenLabsVoice(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
+}
+
+func TestWithRetry_SucceedsFirstTry(t *testing.T) {
+	calls := 0
+	got, err := withRetry("first-try", func() ([]byte, error) {
+		calls++
+		return []byte("ok"), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if calls != 1 {
+		t.Fatalf("expected 1 call, got %d", calls)
+	}
+	if string(got) != "ok" {
+		t.Fatalf("expected payload %q, got %q", "ok", string(got))
+	}
+}
+
+func TestWithRetry_RecoversAfterTransientFailure(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	calls := 0
+	got, err := withRetry("transient", func() ([]byte, error) {
+		calls++
+		if calls < 2 {
+			return nil, errors.New("temporary")
+		}
+		return []byte("done"), nil
+	})
+	if err != nil {
+		t.Fatalf("unexpected error after retry: %v", err)
+	}
+	if calls != 2 {
+		t.Fatalf("expected 2 calls, got %d", calls)
+	}
+	if string(got) != "done" {
+		t.Fatalf("expected payload %q, got %q", "done", string(got))
+	}
+}
+
+func TestWithRetry_GivesUpAfterMaxAttempts(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	wantErr := errors.New("upstream down")
+	calls := 0
+	got, err := withRetry("exhausted", func() ([]byte, error) {
+		calls++
+		return nil, wantErr
+	})
+	if err == nil {
+		t.Fatal("expected error after exhausting retries")
+	}
+	if !errors.Is(err, wantErr) {
+		t.Fatalf("expected wrapped %v, got %v", wantErr, err)
+	}
+	if calls != maxRetries {
+		t.Fatalf("expected %d calls, got %d", maxRetries, calls)
+	}
+	if got != nil {
+		t.Fatalf("expected nil payload on failure, got %q", string(got))
+	}
+}
+
+// swapBackoff temporarily lowers the initial retry backoff so retry tests don't
+// burn real seconds. Returns a restore func meant to be deferred.
+func swapBackoff(d time.Duration) func() {
+	original := initialBackoff
+	initialBackoff = d
+	return func() { initialBackoff = original }
 }
 
 func TestResolveDeepgramVoice(t *testing.T) {

@@ -40,10 +40,11 @@ const (
 
 	// Number of attempts per chunk before giving up.
 	maxRetries = 3
-
-	// Initial backoff between retries (doubled each attempt).
-	initialBackoff = 1 * time.Second
 )
+
+// Initial backoff between retries (doubled each attempt). Declared as a var
+// rather than a const so tests can swap it in for fast-running retry tests.
+var initialBackoff = 1 * time.Second
 
 var openAIVoices = []string{"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
 
