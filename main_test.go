@@ -1357,3 +1357,802 @@ func TestResolveDeepgramVoice(t *testing.T) {
 		}
 	}
 }
+
+// --- Sound effects (ElevenLabs sound-generation) ---
+
+func TestSynthesizeSoundEffect_SendsExpectedRequest(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 'S', 'F', 'X'}
+
+	var captured struct {
+		method, path, key, contentType, query string
+		raw                                   map[string]any
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured.method = r.Method
+		captured.path = r.URL.Path
+		captured.query = r.URL.RawQuery
+		captured.key = r.Header.Get("xi-api-key")
+		captured.contentType = r.Header.Get("Content-Type")
+		_ = json.NewDecoder(r.Body).Decode(&captured.raw)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	dur := 7.5
+	got, err := synthesizeSoundEffect("xi-test", "eleven_text_to_sound_v2", "thunder rolling", &dur, 0.8, true)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytesEqual(got, wantAudio) {
+		t.Fatalf("audio mismatch: got %x, want %x", got, wantAudio)
+	}
+	if captured.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", captured.method)
+	}
+	if captured.key != "xi-test" {
+		t.Errorf("xi-api-key = %q, want xi-test", captured.key)
+	}
+	if captured.contentType != "application/json" {
+		t.Errorf("Content-Type = %q", captured.contentType)
+	}
+	if !strings.Contains(captured.query, "output_format=mp3_44100_128") {
+		t.Errorf("expected mp3 output_format query, got %q", captured.query)
+	}
+	if captured.raw["text"] != "thunder rolling" {
+		t.Errorf("text = %v, want thunder rolling", captured.raw["text"])
+	}
+	if captured.raw["model_id"] != "eleven_text_to_sound_v2" {
+		t.Errorf("model_id = %v", captured.raw["model_id"])
+	}
+	if captured.raw["duration_seconds"] != 7.5 {
+		t.Errorf("duration_seconds = %v, want 7.5", captured.raw["duration_seconds"])
+	}
+	if captured.raw["prompt_influence"] != 0.8 {
+		t.Errorf("prompt_influence = %v, want 0.8", captured.raw["prompt_influence"])
+	}
+	if captured.raw["loop"] != true {
+		t.Errorf("loop = %v, want true", captured.raw["loop"])
+	}
+}
+
+// A nil duration must be omitted from the payload entirely: sending an explicit
+// null or zero would be rejected, and omission is what makes the model infer
+// the length from the prompt.
+func TestSynthesizeSoundEffect_OmitsUnsetDuration(t *testing.T) {
+	var raw map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	if _, err := synthesizeSoundEffect("xi", "m", "a door creaking", nil, 0.3, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, present := raw["duration_seconds"]; present {
+		t.Errorf("duration_seconds should be omitted when unset, got %v", raw["duration_seconds"])
+	}
+}
+
+// prompt_influence of 0 is meaningful (maximum variability), so it must survive
+// serialisation rather than being dropped as a zero value.
+func TestSynthesizeSoundEffect_SendsZeroInfluence(t *testing.T) {
+	var raw map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	if _, err := synthesizeSoundEffect("xi", "m", "silence", nil, 0, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	got, present := raw["prompt_influence"]
+	if !present {
+		t.Fatal("prompt_influence must always be sent, even at 0")
+	}
+	if got != float64(0) {
+		t.Errorf("prompt_influence = %v, want 0", got)
+	}
+}
+
+func TestSynthesizeSoundEffect_ReturnsErrorOnNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = io.WriteString(w, `{"detail":"prompt too long"}`)
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	_, err := synthesizeSoundEffect("xi", "m", "boom", nil, 0.3, false)
+	if err == nil {
+		t.Fatal("expected error on 422")
+	}
+	if !strings.Contains(err.Error(), "422") || !strings.Contains(err.Error(), "prompt too long") {
+		t.Fatalf("expected status and body in error, got %v", err)
+	}
+}
+
+func TestSynthesizeSoundEffect_FailsOnUnreachable(t *testing.T) {
+	defer swapURL(&elevenLabsSFXAPIURL, unreachableURL(t))()
+	_, err := synthesizeSoundEffect("xi", "m", "boom", nil, 0.3, false)
+	assertNetworkError(t, err)
+}
+
+func TestSynthesizeSoundEffect_FailsOnMalformedURL(t *testing.T) {
+	defer swapURL(&elevenLabsSFXAPIURL, "://bad")()
+	_, err := synthesizeSoundEffect("xi", "m", "boom", nil, 0.3, false)
+	assertRequestBuildError(t, err)
+}
+
+func TestRun_SFXHappyPathWritesFile(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 'S', 'X'}
+	var raw map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-o", out, "glass", "shattering"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("output file not written: %v", err)
+	}
+	if !bytesEqual(got, wantAudio) {
+		t.Fatalf("file contents = %x, want %x", got, wantAudio)
+	}
+	if raw["text"] != "glass shattering" {
+		t.Errorf("prompt = %v, want 'glass shattering'", raw["text"])
+	}
+	// --sfx must default to the sound model, not the speech model.
+	if raw["model_id"] != defaultSFXModel {
+		t.Errorf("model_id = %v, want %s", raw["model_id"], defaultSFXModel)
+	}
+}
+
+// --sfx must not route through the ElevenLabs text-to-speech endpoint.
+func TestRun_SFXDoesNotHitSpeechEndpoint(t *testing.T) {
+	speechHits := 0
+	speech := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		speechHits++
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer speech.Close()
+	defer swapURL(&elevenLabsAPIURL, speech.URL)()
+
+	sfxHits := 0
+	sfxServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		sfxHits++
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer sfxServer.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, sfxServer.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-o", out, "rain"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, stderr=%q", code, stderr)
+	}
+	if speechHits != 0 {
+		t.Errorf("speech endpoint hit %d times, want 0", speechHits)
+	}
+	if sfxHits != 1 {
+		t.Errorf("sfx endpoint hit %d times, want 1", sfxHits)
+	}
+}
+
+// --sfx implies the elevenlabs provider, so it must read ELEVENLABS_API_KEY
+// even though the provider flag was never passed.
+func TestRun_SFXUsesElevenLabsKeyWithoutProviderFlag(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--sfx", "thunder"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "openai-only"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "ELEVENLABS_API_KEY") {
+		t.Errorf("expected ElevenLabs key error, got %q", stderr)
+	}
+}
+
+func TestRun_SFXRejectsNonElevenLabsProvider(t *testing.T) {
+	for _, p := range []string{"openai", "deepgram"} {
+		code, stderr := runCLI(t, []string{"--sfx", "-p", p, "thunder"}, "",
+			envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+		if code != 1 {
+			t.Errorf("provider %s: exit code = %d, want 1", p, code)
+		}
+		if !strings.Contains(stderr, "only supported by the elevenlabs provider") {
+			t.Errorf("provider %s: unexpected stderr %q", p, stderr)
+		}
+	}
+}
+
+func TestRun_SFXAcceptsExplicitElevenLabsProvider(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-p", "ElevenLabs", "-o", out, "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+}
+
+func TestRun_SFXRejectsOutOfRangeDuration(t *testing.T) {
+	for _, d := range []string{"0.4", "30.1", "-3"} {
+		code, stderr := runCLI(t, []string{"--sfx", "-d", d, "thunder"}, "",
+			envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+		if code != 1 {
+			t.Errorf("duration %s: exit code = %d, want 1", d, code)
+		}
+		if !strings.Contains(stderr, "Duration must be between") {
+			t.Errorf("duration %s: unexpected stderr %q", d, stderr)
+		}
+	}
+}
+
+func TestRun_SFXRejectsOutOfRangeInfluence(t *testing.T) {
+	for _, i := range []string{"-0.1", "1.1"} {
+		code, stderr := runCLI(t, []string{"--sfx", "--influence", i, "thunder"}, "",
+			envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+		if code != 1 {
+			t.Errorf("influence %s: exit code = %d, want 1", i, code)
+		}
+		if !strings.Contains(stderr, "Influence must be between") {
+			t.Errorf("influence %s: unexpected stderr %q", i, stderr)
+		}
+	}
+}
+
+// Speed has no meaning for a sound effect, so the ElevenLabs speech speed range
+// must not be enforced in --sfx mode.
+func TestRun_SFXIgnoresSpeedRangeButWarns(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-x", "3.0", "-o", out, "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "does not apply to sound effects") {
+		t.Errorf("expected ignored-flag warning, got %q", stderr)
+	}
+}
+
+func TestRun_SFXWarnsOnIrrelevantVoiceFlags(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t,
+		[]string{"--sfx", "-v", "josh", "--stability", "0.9", "--similarity", "0.2", "-o", out, "thunder"},
+		"", envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	for _, want := range []string{"-v does not apply", "--stability does not apply", "--similarity does not apply"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("missing warning %q in stderr %q", want, stderr)
+		}
+	}
+}
+
+// The sound-effect-only flags are silently meaningless in speech mode, so the
+// user gets told rather than left wondering why nothing changed.
+func TestRun_WarnsWhenSFXFlagsUsedWithoutSFX(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	out := t.TempDir() + "/out.mp3"
+	code, stderr := runCLI(t, []string{"-d", "5", "--loop", "--influence", "0.9", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	for _, want := range []string{"-d only applies with --sfx", "--loop only applies with --sfx", "--influence only applies with --sfx"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("missing warning %q in stderr %q", want, stderr)
+		}
+	}
+}
+
+func TestRun_SFXRejectsAllFlag(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--sfx", "--all", "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--all cannot be combined with --sfx") {
+		t.Errorf("unexpected stderr %q", stderr)
+	}
+}
+
+func TestRun_SFXEmptyPromptReportsPromptError(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--sfx"}, "   ",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "No sound effect prompt provided") {
+		t.Errorf("unexpected stderr %q", stderr)
+	}
+}
+
+// A long prompt must reach the API intact rather than being chunked into
+// several separate sound effects and concatenated.
+func TestRun_SFXDoesNotChunkLongPrompts(t *testing.T) {
+	longPrompt := strings.Repeat("rolling thunder over a wide valley ", 80) // >1500 chars
+	var bodies []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body ElevenLabsSFXRequest
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		bodies = append(bodies, body.Text)
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-o", out}, longPrompt,
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if len(bodies) != 1 {
+		t.Fatalf("expected exactly 1 request, got %d", len(bodies))
+	}
+	if bodies[0] != strings.TrimSpace(longPrompt) {
+		t.Errorf("prompt was altered: got %d chars, want %d", len(bodies[0]), len(strings.TrimSpace(longPrompt)))
+	}
+}
+
+func TestRun_SFXRetriesTransientFailures(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-o", out, "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want 2", attempts)
+	}
+}
+
+func TestRun_SFXFailureReportsSoundEffectError(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnprocessableEntity)
+		_, _ = io.WriteString(w, `{"detail":"bad prompt"}`)
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	code, stderr := runCLI(t, []string{"--sfx", "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "Error generating sound effect") {
+		t.Errorf("expected sound-effect-specific error, got %q", stderr)
+	}
+}
+
+func TestRun_SFXPlaysAudioWhenNoOutputFile(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 'P', 'X'}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	captured, restore := stubAudio()
+	defer restore()
+
+	code, stderr := runCLI(t, []string{"--sfx", "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if len(*captured) != 1 || !bytesEqual((*captured)[0], wantAudio) {
+		t.Fatalf("expected the sound effect to be played, got %d plays", len(*captured))
+	}
+}
+
+func TestRun_SFXHonoursTokenFlag(t *testing.T) {
+	var key string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		key = r.Header.Get("xi-api-key")
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "--token", "flag-key", "-o", out, "thunder"}, "", emptyEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if key != "flag-key" {
+		t.Errorf("xi-api-key = %q, want flag-key", key)
+	}
+}
+
+func TestRun_SFXModelFlagOverridesDefault(t *testing.T) {
+	var raw map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-m", "eleven_text_to_sound_v1", "-o", out, "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if raw["model_id"] != "eleven_text_to_sound_v1" {
+		t.Errorf("model_id = %v, want eleven_text_to_sound_v1", raw["model_id"])
+	}
+}
+
+func TestRun_HelpMentionsSoundEffects(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--help"}, "", emptyEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	for _, want := range []string{"--sfx", "--duration", "--influence", "--loop", "Sound effects"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("help missing %q", want)
+		}
+	}
+}
+
+// --- Regression tests for the adversarial review findings ---
+
+// The tuning flags must actually reach the wire. Without this, --duration,
+// --influence and --loop could all be disconnected and the suite would stay green.
+func TestRun_SFXTuningFlagsReachRequestBody(t *testing.T) {
+	var raw map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t,
+		[]string{"--sfx", "-d", "12.5", "--influence", "0.85", "--loop", "-o", out, "rain"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if raw["duration_seconds"] != 12.5 {
+		t.Errorf("duration_seconds = %v, want 12.5", raw["duration_seconds"])
+	}
+	if raw["prompt_influence"] != 0.85 {
+		t.Errorf("prompt_influence = %v, want 0.85", raw["prompt_influence"])
+	}
+	if raw["loop"] != true {
+		t.Errorf("loop = %v, want true", raw["loop"])
+	}
+}
+
+// The long-form --duration spelling must be wired to the same variable as -d.
+func TestRun_SFXLongDurationFlagReachesRequestBody(t *testing.T) {
+	var raw map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, _ := runCLI(t, []string{"--sfx", "--duration", "3", "-o", out, "rain"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	if raw["duration_seconds"] != float64(3) {
+		t.Errorf("duration_seconds = %v, want 3", raw["duration_seconds"])
+	}
+}
+
+// loop is a v2-only field, so it must not be pinned to false on every request.
+func TestSynthesizeSoundEffect_OmitsLoopWhenFalse(t *testing.T) {
+	var raw map[string]any
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&raw)
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	if _, err := synthesizeSoundEffect("xi", "m", "boom", nil, 0.3, false); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, present := raw["loop"]; present {
+		t.Errorf("loop should be omitted when false, got %v", raw["loop"])
+	}
+}
+
+// NaN passes every naive range comparison, so it must be rejected explicitly
+// rather than reaching json.Marshal and failing there.
+func TestRun_SFXRejectsNaNAndInfTuningValues(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	cases := []struct{ flag, value, wantMsg string }{
+		{"-d", "NaN", "Duration must be between"},
+		{"-d", "+Inf", "Duration must be between"},
+		{"--influence", "NaN", "Influence must be between"},
+		{"--influence", "+Inf", "Influence must be between"},
+	}
+	for _, c := range cases {
+		code, stderr := runCLI(t, []string{"--sfx", c.flag, c.value, "thunder"}, "",
+			envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+		if code != 1 {
+			t.Errorf("%s %s: exit code = %d, want 1", c.flag, c.value, code)
+		}
+		if !strings.Contains(stderr, c.wantMsg) {
+			t.Errorf("%s %s: stderr = %q, want %q", c.flag, c.value, stderr, c.wantMsg)
+		}
+	}
+	if hits != 0 {
+		t.Errorf("invalid tuning values reached the API %d times, want 0", hits)
+	}
+}
+
+// A permanent rejection must fail on the first response instead of burning two
+// more API calls and 3 seconds of backoff.
+func TestWithRetry_DoesNotRetryPermanentErrors(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	var attempts int
+	_, err := withRetry("thing", func() ([]byte, error) {
+		attempts++
+		return nil, permanent(errors.New("API error (401): bad key"))
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1 (permanent errors must not be retried)", attempts)
+	}
+	if !strings.Contains(err.Error(), "bad key") {
+		t.Errorf("underlying error lost: %v", err)
+	}
+	if strings.Contains(err.Error(), "after 3 attempts") {
+		t.Errorf("permanent failure should not claim 3 attempts: %v", err)
+	}
+}
+
+func TestAPIError_ClassifiesStatusCodes(t *testing.T) {
+	cases := []struct {
+		status        int
+		wantPermanent bool
+	}{
+		{http.StatusBadRequest, true},
+		{http.StatusUnauthorized, true},
+		{http.StatusForbidden, true},
+		{http.StatusNotFound, true},
+		{http.StatusUnprocessableEntity, true},
+		{http.StatusTooManyRequests, false}, // rate limited: retrying is the point
+		{http.StatusInternalServerError, false},
+		{http.StatusBadGateway, false},
+		{http.StatusServiceUnavailable, false},
+	}
+	for _, c := range cases {
+		resp := &http.Response{
+			StatusCode: c.status,
+			Body:       io.NopCloser(strings.NewReader("boom")),
+		}
+		err := apiError(resp)
+		if got := isPermanent(err); got != c.wantPermanent {
+			t.Errorf("status %d: isPermanent = %v, want %v", c.status, got, c.wantPermanent)
+		}
+		if !strings.Contains(err.Error(), "boom") {
+			t.Errorf("status %d: body missing from error %v", c.status, err)
+		}
+	}
+}
+
+// A stale API key should cost the user one request, not three.
+func TestRun_SFXDoesNotRetryClientErrors(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"detail":"Invalid API key"}`)
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	code, stderr := runCLI(t, []string{"--sfx", "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "stale"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1", attempts)
+	}
+	if !strings.Contains(stderr, "Invalid API key") {
+		t.Errorf("expected the API message to be surfaced, got %q", stderr)
+	}
+}
+
+// 429 means "slow down", which is exactly what the backoff is for.
+func TestRun_SFXStillRetriesRateLimits(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		if attempts < 3 {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	out := t.TempDir() + "/sfx.mp3"
+	code, stderr := runCLI(t, []string{"--sfx", "-o", out, "thunder"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if attempts != 3 {
+		t.Errorf("attempts = %d, want 3", attempts)
+	}
+}
+
+// The speech providers share withRetry, so they inherit fail-fast too.
+func TestRun_SpeechDoesNotRetryClientErrors(t *testing.T) {
+	defer swapBackoff(time.Millisecond)()
+
+	var attempts int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		attempts++
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"bad key"}`)
+	}))
+	defer server.Close()
+	defer swapURL(&openAIAPIURL, server.URL)()
+
+	code, _ := runCLI(t, []string{"hello"}, "", envMap(map[string]string{"OPENAI_API_KEY": "stale"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if attempts != 1 {
+		t.Errorf("attempts = %d, want 1", attempts)
+	}
+}
+
+// A whitespace-only prompt passed as an argument must be caught locally rather
+// than spending an API call to be told it is empty.
+func TestRun_SFXRejectsWhitespaceOnlyArgumentPrompt(t *testing.T) {
+	hits := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		_, _ = w.Write([]byte{0xFF, 0xFB})
+	}))
+	defer server.Close()
+	defer swapURL(&elevenLabsSFXAPIURL, server.URL)()
+
+	code, stderr := runCLI(t, []string{"--sfx", "   "}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "No sound effect prompt provided") {
+		t.Errorf("unexpected stderr %q", stderr)
+	}
+	if hits != 0 {
+		t.Errorf("whitespace prompt reached the API %d times, want 0", hits)
+	}
+}
+
+// The same trimming must not break the speech path.
+func TestRun_RejectsWhitespaceOnlyArgumentText(t *testing.T) {
+	code, stderr := runCLI(t, []string{"  "}, "", envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "No text provided") {
+		t.Errorf("unexpected stderr %q", stderr)
+	}
+}
+
+// Contradictory flags should be reported before environment-dependent checks,
+// so the user hears about the real mistake first.
+func TestRun_SFXAllConflictReportedBeforeMissingKey(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--sfx", "--all", "boom"}, "", emptyEnv)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--all cannot be combined with --sfx") {
+		t.Errorf("expected the flag conflict, got %q", stderr)
+	}
+	if strings.Contains(stderr, "ELEVENLABS_API_KEY") {
+		t.Errorf("missing-key error masked the real problem: %q", stderr)
+	}
+}
+
+func TestRun_SFXAllConflictReportedBeforeEmptyPrompt(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--sfx", "--all"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "--all cannot be combined with --sfx") {
+		t.Errorf("expected the flag conflict, got %q", stderr)
+	}
+}
+
+func TestFlagName(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"d", "-d"},
+		{"v", "-v"},
+		{"duration", "--duration"},
+		{"stability", "--stability"},
+	}
+	for _, c := range cases {
+		if got := flagName(c.in); got != c.want {
+			t.Errorf("flagName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -23,6 +24,15 @@ const (
 	// ElevenLabs defaults
 	defaultElevenLabsVoice = "rachel"
 	defaultElevenLabsModel = "eleven_multilingual_v2"
+
+	// ElevenLabs sound-effect defaults
+	defaultSFXModel = "eleven_text_to_sound_v2"
+	// 0.3 matches the API's own default for prompt_influence.
+	defaultPromptInfluence = 0.3
+	// Sound-effect duration bounds accepted by the API. A duration of 0 means
+	// "let the model pick", which is the API's behaviour when the field is omitted.
+	minSFXDuration = 0.5
+	maxSFXDuration = 30.0
 
 	// Deepgram defaults
 	defaultDeepgramVoice = "aura-asteria-en"
@@ -46,9 +56,10 @@ var initialBackoff = 1 * time.Second
 // Provider endpoint URLs. Declared as vars so tests can repoint them at an
 // httptest server without touching the calling code.
 var (
-	openAIAPIURL     = "https://api.openai.com/v1/audio/speech"
-	elevenLabsAPIURL = "https://api.elevenlabs.io/v1/text-to-speech"
-	deepgramAPIURL   = "https://api.deepgram.com/v1/speak"
+	openAIAPIURL        = "https://api.openai.com/v1/audio/speech"
+	elevenLabsAPIURL    = "https://api.elevenlabs.io/v1/text-to-speech"
+	elevenLabsSFXAPIURL = "https://api.elevenlabs.io/v1/sound-generation"
+	deepgramAPIURL      = "https://api.deepgram.com/v1/speak"
 )
 
 var openAIVoices = []string{"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
@@ -87,12 +98,12 @@ var deepgramVoices = map[string]string{
 	"helios":  "aura-helios-en",
 	"zeus":    "aura-zeus-en",
 	// Aura 2 voices (English)
-	"thalia":   "aura-2-thalia-en",
+	"thalia":    "aura-2-thalia-en",
 	"andromeda": "aura-2-andromeda-en",
-	"helena":   "aura-2-helena-en",
-	"jason":    "aura-2-jason-en",
-	"apollo":   "aura-2-apollo-en",
-	"ares":     "aura-2-ares-en",
+	"helena":    "aura-2-helena-en",
+	"jason":     "aura-2-jason-en",
+	"apollo":    "aura-2-apollo-en",
+	"ares":      "aura-2-ares-en",
 }
 
 // Deepgram TTS request
@@ -111,9 +122,22 @@ type OpenAITTSRequest struct {
 
 // ElevenLabs TTS request
 type ElevenLabsTTSRequest struct {
-	Text          string                    `json:"text"`
-	ModelID       string                    `json:"model_id"`
+	Text          string                   `json:"text"`
+	ModelID       string                   `json:"model_id"`
 	VoiceSettings *ElevenLabsVoiceSettings `json:"voice_settings,omitempty"`
+}
+
+// ElevenLabs sound-effect request. DurationSeconds is a pointer so that an
+// unset duration is omitted entirely, which tells the API to infer the best
+// length from the prompt.
+type ElevenLabsSFXRequest struct {
+	Text            string   `json:"text"`
+	ModelID         string   `json:"model_id"`
+	DurationSeconds *float64 `json:"duration_seconds,omitempty"`
+	PromptInfluence float64  `json:"prompt_influence"`
+	// Looping is a v2-model-only feature, so the field is sent only when the
+	// user actually asked for it rather than pinned to false on every request.
+	Loop bool `json:"loop,omitempty"`
 }
 
 type ElevenLabsVoiceSettings struct {
@@ -156,6 +180,10 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		allFlag         bool
 		stability       float64
 		similarityBoost float64
+		sfx             bool
+		duration        float64
+		promptInfluence float64
+		loop            bool
 	)
 
 	fs := flag.NewFlagSet("gospeak", flag.ContinueOnError)
@@ -179,6 +207,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	fs.BoolVar(&allFlag, "all", false, "Use all voices (OpenAI only)")
 	fs.Float64Var(&stability, "stability", 0.5, "Voice stability (ElevenLabs only, 0.0-1.0)")
 	fs.Float64Var(&similarityBoost, "similarity", 0.75, "Similarity boost (ElevenLabs only, 0.0-1.0)")
+	fs.BoolVar(&sfx, "sfx", false, "Generate a sound effect from the prompt (ElevenLabs only)")
+	fs.Float64Var(&duration, "duration", 0, "Sound effect length in seconds, 0.5-30 (0 = let the model decide)")
+	fs.Float64Var(&duration, "d", 0, "Sound effect length in seconds (shorthand)")
+	fs.Float64Var(&promptInfluence, "influence", defaultPromptInfluence, "How closely the sound effect follows the prompt, 0.0-1.0")
+	fs.BoolVar(&loop, "loop", false, "Generate a seamlessly looping sound effect")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS API\n\n")
@@ -195,6 +228,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "      --all         Speak with all voices (OpenAI only)\n")
 		fmt.Fprintf(stderr, "      --stability   Voice stability, 0.0-1.0 (ElevenLabs only)\n")
 		fmt.Fprintf(stderr, "      --similarity  Similarity boost, 0.0-1.0 (ElevenLabs only)\n")
+		fmt.Fprintf(stderr, "      --sfx         Generate a sound effect instead of speech (ElevenLabs)\n")
+		fmt.Fprintf(stderr, "  -d, --duration    Sound effect length in seconds, 0.5-30 (--sfx only,\n")
+		fmt.Fprintf(stderr, "                    omit or pass 0 to let the model decide)\n")
+		fmt.Fprintf(stderr, "      --influence   Prompt adherence, 0.0-1.0 (--sfx only)\n")
+		fmt.Fprintf(stderr, "      --loop        Make the sound effect loop seamlessly (--sfx only)\n")
 		fmt.Fprintf(stderr, "  -h, --help        Show this help message\n\n")
 
 		fmt.Fprintf(stderr, "OpenAI:\n")
@@ -212,6 +250,14 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "           eleven_turbo_v2, eleven_monolingual_v1\n")
 		fmt.Fprintf(stderr, "  Speed:   0.7 to 1.2\n\n")
 
+		fmt.Fprintf(stderr, "Sound effects (--sfx, ElevenLabs):\n")
+		fmt.Fprintf(stderr, "  Env var:   ELEVENLABS_API_KEY\n")
+		fmt.Fprintf(stderr, "  Prompt:    describe the sound, e.g. \"distant thunder rolling\"\n")
+		fmt.Fprintf(stderr, "  Models:    eleven_text_to_sound_v2 (default)\n")
+		fmt.Fprintf(stderr, "  Duration:  0.5 to 30 seconds (omit or pass 0 to let the model decide)\n")
+		fmt.Fprintf(stderr, "  Influence: 0.0 to 1.0 (default: 0.3)\n")
+		fmt.Fprintf(stderr, "  Note:      voice, speed, stability and similarity do not apply\n\n")
+
 		fmt.Fprintf(stderr, "Deepgram:\n")
 		fmt.Fprintf(stderr, "  Env var: DEEPGRAM_API_KEY\n")
 		fmt.Fprintf(stderr, "  Voices:  asteria (default), luna, stella, athena, hera, orion,\n")
@@ -226,6 +272,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "  gospeak -p deepgram -v asteria \"Hello from Deepgram\"\n")
 		fmt.Fprintf(stderr, "  echo \"Hello\" | gospeak -v nova\n")
 		fmt.Fprintf(stderr, "  gospeak -o output.mp3 \"Save this to a file\"\n")
+		fmt.Fprintf(stderr, "  gospeak --sfx \"glass shattering on concrete\"\n")
+		fmt.Fprintf(stderr, "  gospeak --sfx -d 8 --loop -o rain.mp3 \"steady rain on a tin roof\"\n")
 	}
 
 	if err := fs.Parse(args); err != nil {
@@ -237,7 +285,51 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		return 0
 	}
 
+	// Which flags the user actually typed. Sound-effect mode shares a flag set
+	// with speech mode, so this is how we tell "user asked for a voice" apart
+	// from "voice is sitting at its default".
+	setFlags := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) { setFlags[f.Name] = true })
+	wasSet := func(names ...string) bool {
+		for _, n := range names {
+			if setFlags[n] {
+				return true
+			}
+		}
+		return false
+	}
+
 	provider = strings.ToLower(provider)
+
+	if sfx {
+		// Contradictory flags are worth reporting before anything that depends
+		// on the environment, so the user hears about the real mistake rather
+		// than a missing API key or an empty prompt.
+		if allFlag {
+			fmt.Fprintln(stderr, "Error: --all cannot be combined with --sfx")
+			return 1
+		}
+		// Sound effects are an ElevenLabs capability, so --sfx selects that
+		// provider. Only complain if the user explicitly asked for another one.
+		if wasSet("provider", "p") && provider != "elevenlabs" {
+			fmt.Fprintf(stderr, "Error: --sfx is only supported by the elevenlabs provider (got '%s')\n", provider)
+			return 1
+		}
+		provider = "elevenlabs"
+
+		for _, name := range []string{"v", "voice", "x", "speed", "stability", "similarity"} {
+			if setFlags[name] {
+				fmt.Fprintf(stderr, "Warning: %s does not apply to sound effects, ignoring\n", flagName(name))
+			}
+		}
+	} else {
+		for _, name := range []string{"d", "duration", "influence", "loop"} {
+			if setFlags[name] {
+				fmt.Fprintf(stderr, "Warning: %s only applies with --sfx, ignoring\n", flagName(name))
+			}
+		}
+	}
+
 	if provider != "openai" && provider != "elevenlabs" && provider != "deepgram" {
 		fmt.Fprintf(stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', or 'deepgram'\n", provider)
 		return 1
@@ -254,12 +346,14 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		}
 	}
 	if model == "" {
-		switch provider {
-		case "openai":
+		switch {
+		case sfx:
+			model = defaultSFXModel
+		case provider == "openai":
 			model = defaultOpenAIModel
-		case "elevenlabs":
+		case provider == "elevenlabs":
 			model = defaultElevenLabsModel
-		case "deepgram":
+		case provider == "deepgram":
 			model = ""
 		}
 	}
@@ -285,26 +379,41 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		return 1
 	}
 
-	switch provider {
-	case "openai":
-		if speed < 0.25 || speed > 4.0 {
-			fmt.Fprintln(stderr, "Error: Speed must be between 0.25 and 4.0 for OpenAI")
+	if sfx {
+		// A duration of 0 means "unset" — the model picks a length from the prompt.
+		// These bounds are written as "not inside the range" rather than "outside
+		// it" so that NaN, for which every comparison is false, is rejected too.
+		if duration != 0 && !(duration >= minSFXDuration && duration <= maxSFXDuration) {
+			fmt.Fprintf(stderr, "Error: Duration must be between %g and %g seconds (or 0 to let the model decide)\n",
+				minSFXDuration, maxSFXDuration)
 			return 1
 		}
-	case "elevenlabs":
-		if speed < 0.7 || speed > 1.2 {
-			fmt.Fprintln(stderr, "Error: Speed must be between 0.7 and 1.2 for ElevenLabs")
+		if !(promptInfluence >= 0 && promptInfluence <= 1) {
+			fmt.Fprintln(stderr, "Error: Influence must be between 0.0 and 1.0")
 			return 1
 		}
-	case "deepgram":
-		if speed != defaultSpeed {
-			fmt.Fprintln(stderr, "Warning: Speed adjustment is not supported for Deepgram, ignoring")
+	} else {
+		switch provider {
+		case "openai":
+			if speed < 0.25 || speed > 4.0 {
+				fmt.Fprintln(stderr, "Error: Speed must be between 0.25 and 4.0 for OpenAI")
+				return 1
+			}
+		case "elevenlabs":
+			if speed < 0.7 || speed > 1.2 {
+				fmt.Fprintln(stderr, "Error: Speed must be between 0.7 and 1.2 for ElevenLabs")
+				return 1
+			}
+		case "deepgram":
+			if speed != defaultSpeed {
+				fmt.Fprintln(stderr, "Warning: Speed adjustment is not supported for Deepgram, ignoring")
+			}
 		}
 	}
 
 	var text string
 	if fs.NArg() > 0 {
-		text = strings.Join(fs.Args(), " ")
+		text = strings.TrimSpace(strings.Join(fs.Args(), " "))
 	} else {
 		data, err := io.ReadAll(stdin)
 		if err != nil {
@@ -315,7 +424,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	}
 
 	if text == "" {
-		fmt.Fprintln(stderr, "Error: No text provided")
+		if sfx {
+			fmt.Fprintln(stderr, "Error: No sound effect prompt provided")
+		} else {
+			fmt.Fprintln(stderr, "Error: No text provided")
+		}
 		fs.Usage()
 		return 1
 	}
@@ -358,8 +471,18 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	var audioData []byte
 	var err error
 
-	switch provider {
-	case "openai":
+	switch {
+	case sfx:
+		// A sound-effect prompt is a single instruction, not narration, so it
+		// is sent whole rather than chunked and stitched back together.
+		var durationSeconds *float64
+		if duration != 0 {
+			durationSeconds = &duration
+		}
+		audioData, err = withRetry("sound effect", func() ([]byte, error) {
+			return synthesizeSoundEffect(apiKey, model, text, durationSeconds, promptInfluence, loop)
+		})
+	case provider == "openai":
 		if !isValidOpenAIVoice(voice) {
 			fmt.Fprintf(stderr, "Error: Invalid OpenAI voice '%s'. Valid voices: %s\n", voice, strings.Join(openAIVoices, ", "))
 			return 1
@@ -367,12 +490,12 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeOpenAI(apiKey, model, voice, chunk, speed)
 		})
-	case "elevenlabs":
+	case provider == "elevenlabs":
 		voiceID := resolveElevenLabsVoice(voice)
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeElevenLabs(apiKey, model, voiceID, chunk, speed, stability, similarityBoost)
 		})
-	case "deepgram":
+	case provider == "deepgram":
 		voiceModel := resolveDeepgramVoice(voice)
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeDeepgram(apiKey, voiceModel, chunk)
@@ -380,7 +503,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	}
 
 	if err != nil {
-		fmt.Fprintf(stderr, "Error synthesizing speech: %v\n", err)
+		if sfx {
+			fmt.Fprintf(stderr, "Error generating sound effect: %v\n", err)
+		} else {
+			fmt.Fprintf(stderr, "Error synthesizing speech: %v\n", err)
+		}
 		return 1
 	}
 
@@ -400,6 +527,15 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	}
 
 	return 0
+}
+
+// flagName renders a flag the way the user would have typed it: one dash for
+// the single-character shorthands, two for the long spellings.
+func flagName(name string) string {
+	if len(name) == 1 {
+		return "-" + name
+	}
+	return "--" + name
 }
 
 func isValidOpenAIVoice(voice string) bool {
@@ -546,6 +682,35 @@ func synthesizeChunked(text string, synth func(string) ([]byte, error)) ([]byte,
 	return combined, nil
 }
 
+// permanentError marks a failure that cannot possibly succeed on a retry: a
+// request we failed to build, or a 4xx rejection from the provider. Retrying
+// these just burns wall-clock time and metered API calls on a guaranteed
+// failure, so withRetry surfaces them immediately.
+type permanentError struct{ err error }
+
+func (e *permanentError) Error() string { return e.err.Error() }
+func (e *permanentError) Unwrap() error { return e.err }
+
+func permanent(err error) error { return &permanentError{err: err} }
+
+func isPermanent(err error) bool {
+	var p *permanentError
+	return errors.As(err, &p)
+}
+
+// apiError builds the error for a non-200 response. Client-side rejections
+// (4xx other than 429, which means "slow down and try again") are marked
+// permanent so a typo'd model or a stale API key fails fast instead of being
+// re-sent three times.
+func apiError(resp *http.Response) error {
+	body, _ := io.ReadAll(resp.Body)
+	err := fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+	if resp.StatusCode >= 400 && resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+		return permanent(err)
+	}
+	return err
+}
+
 // withRetry retries fn up to maxRetries times with exponential backoff.
 // The label is used for log messages so the user can see which chunk is retrying.
 func withRetry(label string, fn func() ([]byte, error)) ([]byte, error) {
@@ -557,6 +722,9 @@ func withRetry(label string, fn func() ([]byte, error)) ([]byte, error) {
 			return data, nil
 		}
 		lastErr = err
+		if isPermanent(err) {
+			return nil, fmt.Errorf("%s failed: %w", label, err)
+		}
 		if attempt < maxRetries {
 			fmt.Fprintf(os.Stderr, "%s: attempt %d/%d failed: %v (retrying in %v)\n",
 				label, attempt, maxRetries, err, backoff)
@@ -578,7 +746,7 @@ func synthesizeOpenAI(apiKey, model, voice, text string, speed float64) ([]byte,
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, permanent(fmt.Errorf("failed to marshal request: %w", err))
 	}
 
 	req, err := http.NewRequest("POST", openAIAPIURL, bytes.NewBuffer(jsonData))
@@ -597,8 +765,7 @@ func synthesizeOpenAI(apiKey, model, voice, text string, speed float64) ([]byte,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+		return nil, apiError(resp)
 	}
 
 	return io.ReadAll(resp.Body)
@@ -617,7 +784,7 @@ func synthesizeElevenLabs(apiKey, model, voiceID, text string, speed, stability,
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, permanent(fmt.Errorf("failed to marshal request: %w", err))
 	}
 
 	url := fmt.Sprintf("%s/%s?output_format=mp3_44100_128", elevenLabsAPIURL, voiceID)
@@ -637,8 +804,47 @@ func synthesizeElevenLabs(apiKey, model, voiceID, text string, speed, stability,
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+		return nil, apiError(resp)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+// synthesizeSoundEffect turns a natural-language prompt into a sound effect via
+// the ElevenLabs sound-generation endpoint. A nil durationSeconds omits the
+// field so the model infers a length from the prompt.
+func synthesizeSoundEffect(apiKey, model, prompt string, durationSeconds *float64, promptInfluence float64, loop bool) ([]byte, error) {
+	reqBody := ElevenLabsSFXRequest{
+		Text:            prompt,
+		ModelID:         model,
+		DurationSeconds: durationSeconds,
+		PromptInfluence: promptInfluence,
+		Loop:            loop,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, permanent(fmt.Errorf("failed to marshal request: %w", err))
+	}
+
+	url := elevenLabsSFXAPIURL + "?output_format=mp3_44100_128"
+	req, err := http.NewRequest("POST", url, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("xi-api-key", apiKey)
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
 	}
 
 	return io.ReadAll(resp.Body)
@@ -651,7 +857,7 @@ func synthesizeDeepgram(apiKey, voiceModel, text string) ([]byte, error) {
 
 	jsonData, err := json.Marshal(reqBody)
 	if err != nil {
-		return nil, fmt.Errorf("failed to marshal request: %w", err)
+		return nil, permanent(fmt.Errorf("failed to marshal request: %w", err))
 	}
 
 	url := fmt.Sprintf("%s?model=%s&encoding=mp3", deepgramAPIURL, voiceModel)
@@ -671,8 +877,7 @@ func synthesizeDeepgram(apiKey, voiceModel, text string) ([]byte, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return nil, fmt.Errorf("API error (%d): %s", resp.StatusCode, string(body))
+		return nil, apiError(resp)
 	}
 
 	return io.ReadAll(resp.Body)
