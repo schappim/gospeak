@@ -93,7 +93,7 @@ Now `gospeak "Hello"` speaks with Josh on ElevenLabs, and `gospeak -v rachel
   "speed": 1.0,
 
   "providers": {
-    "openai":     { "voice": "nova", "model": "tts-1" },
+    "openai":     { "voice": "marin" },
     "elevenlabs": { "voice": "josh", "speed": 1.1 },
     "deepgram":   { "voice": "thalia" }
   }
@@ -186,11 +186,23 @@ gospeak -p elevenlabs -v "your-custom-voice-id" "Hello"
 
 ### Choose a Voice
 
-**OpenAI voices:** `alloy` (default), `echo`, `fable`, `onyx`, `nova`, `shimmer`
+**OpenAI voices:** `alloy` (default), `ash`, `ballad`, `coral`, `echo`, `fable`, `nova`, `onyx`, `sage`, `shimmer`, `verse`, `marin`, `cedar`
 
 ```bash
 gospeak -v nova "Hello with the nova voice"
-gospeak -v echo "This is the echo voice"
+gospeak -v marin "OpenAI rates marin and cedar the best of the roster"
+```
+
+`ballad`, `verse`, `marin` and `cedar` only exist on the `gpt-4o-mini-tts` model —
+`tts-1` and `tts-1-hd` reject them outright. gospeak reaches for that model on
+their behalf, so `gospeak -v marin "..."` just works. The model is a means to the
+voice, so a default or a config-file entry yields to whatever the voice needs; a
+model you typed yourself is a real instruction, and the contradiction is reported
+instead:
+
+```
+$ gospeak -v marin -m tts-1-hd "Hello"
+Error: Voice 'marin' needs the gpt-4o-mini-tts model, which 'tts-1-hd' is not. Drop -m, or pass -m gpt-4o-mini-tts
 ```
 
 **ElevenLabs voices:** `rachel` (default), `domi`, `bella`, `antoni`, `elli`, `josh`, `arnold`, `adam`, `sam`, `george`, `charlie`, `emily`, `lily`, `michael`
@@ -265,11 +277,14 @@ ignored. `--sfx` cannot be combined with `--all`.
 
 ### Hear All Voices (OpenAI)
 
-Demo all OpenAI voices with the same text:
+Demo all 13 OpenAI voices with the same text:
 
 ```bash
 gospeak --all "The quick brown fox jumps over the lazy dog"
 ```
+
+`--all` switches models per voice as needed, so the four `gpt-4o-mini-tts`-only
+voices are demoed too rather than skipped — even if you passed `-m tts-1-hd`.
 
 ### Save to File
 
@@ -319,6 +334,9 @@ gospeak -m tts-1-hd "High definition audio"
 
 # Standard model (faster, lower quality)
 gospeak -m tts-1 "Standard quality"
+
+# Newest model - the only one that speaks the full 13-voice roster
+gospeak -m gpt-4o-mini-tts -v cedar "Newest model"
 ```
 
 **ElevenLabs:**
@@ -361,7 +379,7 @@ gospeak -p elevenlabs -m eleven_turbo_v2_5 "Turbo model"
 | Default voice | `alloy` | `rachel` | `asteria` |
 | Default model | `tts-1-hd` | `eleven_multilingual_v2` | `aura-asteria-en` |
 | Speed range | 0.25 - 4.0 | 0.7 - 1.2 | Not supported |
-| Voice count | 6 built-in | 14 presets + custom | 18 presets + custom |
+| Voice count | 13 built-in | 14 presets + custom | 18 presets + custom |
 | Custom voices | No | Yes (via voice_id) | Yes (via model name) |
 | Sound effects | No | Yes (`--sfx`) | No |
 
@@ -451,7 +469,8 @@ Error: Influence must be between 0.0 and 1.0
 Error: --all cannot be combined with --sfx
 Error: parsing config /Users/you/.gospeak.json: json: unknown field "provdier"
 Error: config /Users/you/.gospeak.json: invalid provider "azure" (use openai, elevenlabs, or deepgram)
-Error: Invalid OpenAI voice 'josh' (from /Users/you/.gospeak.json). Valid voices: alloy, echo, ...
+Error: Invalid OpenAI voice 'josh' (from /Users/you/.gospeak.json). Valid voices: alloy, ash, ...
+Error: Voice 'marin' needs the gpt-4o-mini-tts model, which 'tts-1-hd' is not. Drop -m, or pass -m gpt-4o-mini-tts
 ```
 
 ## Help

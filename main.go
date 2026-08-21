@@ -21,6 +21,9 @@ const (
 	// OpenAI defaults
 	defaultOpenAIVoice = "alloy"
 	defaultOpenAIModel = "tts-1-hd"
+	// The model to reach for when the chosen voice is one the tts-1 family
+	// cannot speak. Every OpenAI voice works on this one.
+	openAIAllVoiceModel = "gpt-4o-mini-tts"
 
 	// ElevenLabs defaults
 	defaultElevenLabsVoice = "rachel"
@@ -63,7 +66,22 @@ var (
 	deepgramAPIURL      = "https://api.deepgram.com/v1/speak"
 )
 
-var openAIVoices = []string{"alloy", "echo", "fable", "onyx", "nova", "shimmer"}
+// The full OpenAI voice roster. marin and cedar are the two OpenAI singles out
+// as the best quality.
+var openAIVoices = []string{
+	"alloy", "ash", "ballad", "coral", "echo", "fable", "nova",
+	"onyx", "sage", "shimmer", "verse", "marin", "cedar",
+}
+
+// The voices tts-1 and tts-1-hd reject outright — they predate this half of the
+// roster. gospeak switches models for them rather than letting the request come
+// back as a bare 400 about an enum.
+var openAIAllVoiceModelOnly = map[string]bool{
+	"ballad": true,
+	"verse":  true,
+	"marin":  true,
+	"cedar":  true,
+}
 
 // ElevenLabs voice presets (name -> voice_id)
 var elevenLabsVoices = map[string]string{
@@ -356,8 +374,12 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 
 		fmt.Fprintf(stderr, "OpenAI:\n")
 		fmt.Fprintf(stderr, "  Env var: OPENAI_API_KEY\n")
-		fmt.Fprintf(stderr, "  Voices:  alloy, echo, fable, onyx, nova, shimmer\n")
-		fmt.Fprintf(stderr, "  Models:  tts-1, tts-1-hd (default: tts-1-hd)\n")
+		fmt.Fprintf(stderr, "  Voices:  alloy, ash, ballad, coral, echo, fable, nova, onyx,\n")
+		fmt.Fprintf(stderr, "           sage, shimmer, verse, marin, cedar\n")
+		fmt.Fprintf(stderr, "           (OpenAI rates marin and cedar the best quality)\n")
+		fmt.Fprintf(stderr, "  Models:  tts-1, tts-1-hd (default: tts-1-hd), gpt-4o-mini-tts\n")
+		fmt.Fprintf(stderr, "           ballad, verse, marin and cedar need gpt-4o-mini-tts;\n")
+		fmt.Fprintf(stderr, "           gospeak picks it for them unless you pass -m yourself\n")
 		fmt.Fprintf(stderr, "  Speed:   0.25 to 4.0\n\n")
 
 		fmt.Fprintf(stderr, "ElevenLabs:\n")
@@ -628,8 +650,12 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		}
 		for _, v := range openAIVoices {
 			fmt.Fprintf(stderr, "Speaking with voice: %s\n", v)
+			// A demo of every voice has to switch models for the four the tts-1
+			// family cannot speak, even when -m named one of them: skipping a
+			// third of the roster would defeat the point of --all.
+			voiceModel := openAIModelForVoice(model, v)
 			audioData, err := synthesizeChunked(v, func(chunk string) ([]byte, error) {
-				return synthesizeOpenAI(apiKey, model, v, chunk, speed)
+				return synthesizeOpenAI(apiKey, voiceModel, v, chunk, speed)
 			})
 			if err != nil {
 				fmt.Fprintf(stderr, "Error synthesizing voice announcement: %v\n", err)
@@ -642,7 +668,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			allVoiceSleep(500 * time.Millisecond)
 
 			audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
-				return synthesizeOpenAI(apiKey, model, v, chunk, speed)
+				return synthesizeOpenAI(apiKey, voiceModel, v, chunk, speed)
 			})
 			if err != nil {
 				fmt.Fprintf(stderr, "Error synthesizing: %v\n", err)
@@ -676,6 +702,16 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 				voice, configOrigin(cfg, voiceFromConfig), strings.Join(openAIVoices, ", "))
 			return 1
 		}
+		// The model is a means to the voice, so a default or a config entry
+		// yields to whatever the voice actually needs. A model typed on the
+		// command line is a real instruction, and a contradiction is reported
+		// rather than quietly overridden.
+		if openAIAllVoiceModelOnly[voice] && !speaksEveryOpenAIVoice(model) && wasSet("model", "m") {
+			fmt.Fprintf(stderr, "Error: Voice '%s' needs the %s model, which '%s' is not. Drop -m, or pass -m %s\n",
+				voice, openAIAllVoiceModel, model, openAIAllVoiceModel)
+			return 1
+		}
+		model = openAIModelForVoice(model, voice)
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeOpenAI(apiKey, model, voice, chunk, speed)
 		})
@@ -729,6 +765,22 @@ func flagName(name string) string {
 
 func isValidProvider(provider string) bool {
 	return provider == "openai" || provider == "elevenlabs" || provider == "deepgram"
+}
+
+// speaksEveryOpenAIVoice reports whether a model can handle the whole roster.
+// Written as "not one of the two that can't" so a model released after this
+// binary is left alone rather than second-guessed.
+func speaksEveryOpenAIVoice(model string) bool {
+	return model != "tts-1" && model != "tts-1-hd"
+}
+
+// openAIModelForVoice upgrades away from the tts-1 family for the voices it
+// cannot speak, and leaves every other combination exactly as asked.
+func openAIModelForVoice(model, voice string) string {
+	if openAIAllVoiceModelOnly[voice] && !speaksEveryOpenAIVoice(model) {
+		return openAIAllVoiceModel
+	}
+	return model
 }
 
 func isValidOpenAIVoice(voice string) bool {

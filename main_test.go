@@ -2881,3 +2881,178 @@ func TestRun_HelpDocumentsTheConfigFile(t *testing.T) {
 		}
 	}
 }
+
+// --- OpenAI voice roster and model selection --------------------------------
+
+func TestOpenAIVoices_CoverTheFullRoster(t *testing.T) {
+	// The roster OpenAI publishes for /v1/audio/speech. Pinned here so a voice
+	// going missing from the list is a test failure rather than a support
+	// question.
+	want := []string{
+		"alloy", "ash", "ballad", "coral", "echo", "fable", "nova",
+		"onyx", "sage", "shimmer", "verse", "marin", "cedar",
+	}
+	if len(openAIVoices) != len(want) {
+		t.Fatalf("roster has %d voices, want %d: %v", len(openAIVoices), len(want), openAIVoices)
+	}
+	for _, v := range want {
+		if !isValidOpenAIVoice(v) {
+			t.Errorf("voice %q missing from the roster", v)
+		}
+	}
+}
+
+func TestSpeaksEveryOpenAIVoice(t *testing.T) {
+	for _, legacy := range []string{"tts-1", "tts-1-hd"} {
+		if speaksEveryOpenAIVoice(legacy) {
+			t.Errorf("speaksEveryOpenAIVoice(%q) = true, want false", legacy)
+		}
+	}
+	// A model this binary has never heard of is left alone rather than
+	// second-guessed, so a future release needs no code change here.
+	for _, capable := range []string{"gpt-4o-mini-tts", "some-future-tts"} {
+		if !speaksEveryOpenAIVoice(capable) {
+			t.Errorf("speaksEveryOpenAIVoice(%q) = false, want true", capable)
+		}
+	}
+}
+
+func TestOpenAIModelForVoice(t *testing.T) {
+	cases := []struct {
+		model, voice, want string
+	}{
+		// The four voices tts-1 and tts-1-hd reject.
+		{"tts-1-hd", "marin", openAIAllVoiceModel},
+		{"tts-1-hd", "cedar", openAIAllVoiceModel},
+		{"tts-1-hd", "ballad", openAIAllVoiceModel},
+		{"tts-1", "verse", openAIAllVoiceModel},
+		// Voices the tts-1 family handles are left on the model as asked.
+		{"tts-1-hd", "alloy", "tts-1-hd"},
+		{"tts-1-hd", "sage", "tts-1-hd"},
+		{"tts-1", "coral", "tts-1"},
+		// A model that already speaks everything is never rewritten.
+		{openAIAllVoiceModel, "marin", openAIAllVoiceModel},
+		{openAIAllVoiceModel, "alloy", openAIAllVoiceModel},
+	}
+	for _, c := range cases {
+		if got := openAIModelForVoice(c.model, c.voice); got != c.want {
+			t.Errorf("openAIModelForVoice(%q, %q) = %q, want %q", c.model, c.voice, got, c.want)
+		}
+	}
+}
+
+func TestRun_UpgradesModelForANewerVoice(t *testing.T) {
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-v", "marin", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	req := rec.decodeOpenAI(t)
+	if req.Model != openAIAllVoiceModel {
+		t.Fatalf("model = %q, want %q", req.Model, openAIAllVoiceModel)
+	}
+	if req.Voice != "marin" {
+		t.Fatalf("voice = %q, want marin", req.Voice)
+	}
+}
+
+func TestRun_ConfigModelYieldsToTheVoiceItCannotSpeak(t *testing.T) {
+	// A model from the config file is a standing default, and defaults yield —
+	// the same way a config provider yields to --sfx.
+	useHomeConfig(t, `{"model": "tts-1-hd"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-v", "cedar", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Model; got != openAIAllVoiceModel {
+		t.Fatalf("model = %q, want %q", got, openAIAllVoiceModel)
+	}
+}
+
+func TestRun_ExplicitModelThatCannotSpeakTheVoiceIsAnError(t *testing.T) {
+	// A model typed on the command line is a real instruction, so the
+	// contradiction is reported rather than quietly overridden.
+	code, stderr := runCLI(t, []string{"-v", "marin", "-m", "tts-1-hd", "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "marin") || !strings.Contains(stderr, openAIAllVoiceModel) {
+		t.Fatalf("expected the voice and the model it needs in the error, got %q", stderr)
+	}
+}
+
+func TestRun_ExplicitCapableModelIsLeftAlone(t *testing.T) {
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-v", "sage", "-m", "tts-1", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Model; got != "tts-1" {
+		t.Fatalf("model = %q, want tts-1", got)
+	}
+}
+
+func TestRun_AllFlagSwitchesModelPerVoice(t *testing.T) {
+	// --all demos the whole roster, so it switches models for the four voices
+	// tts-1-hd cannot speak even though -m named it. Skipping a third of the
+	// roster would defeat the point.
+	var byVoice sync.Map
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req OpenAITTSRequest
+		if err := json.Unmarshal(body, &req); err == nil {
+			byVoice.Store(req.Voice, req.Model)
+		}
+		_, _ = w.Write([]byte{0xFF, 0xFB, 0x00, 0x00})
+	}))
+	defer srv.Close()
+	defer swapURL(&openAIAPIURL, srv.URL)()
+	defer stubAudioReturning(nil)()
+
+	originalSleep := allVoiceSleep
+	allVoiceSleep = func(time.Duration) {}
+	defer func() { allVoiceSleep = originalSleep }()
+
+	code, stderr := runCLI(t, []string{"--all", "-m", "tts-1-hd", "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	for _, v := range openAIVoices {
+		got, ok := byVoice.Load(v)
+		if !ok {
+			t.Errorf("voice %q was never requested", v)
+			continue
+		}
+		want := "tts-1-hd"
+		if openAIAllVoiceModelOnly[v] {
+			want = openAIAllVoiceModel
+		}
+		if got != want {
+			t.Errorf("voice %q used model %v, want %q", v, got, want)
+		}
+	}
+}
+
+func TestRun_HelpListsTheNewerVoices(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--help"}, "", emptyEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	for _, want := range []string{"marin", "cedar", "ballad", "verse", openAIAllVoiceModel} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("expected %q in the help output", want)
+		}
+	}
+}
