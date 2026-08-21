@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -156,6 +157,118 @@ var playAudioFn = playAudio
 // tests can collapse the wait without sacrificing the demo cadence in prod.
 var allVoiceSleep = time.Sleep
 
+// Config file support. gospeak reads an optional JSON file of defaults so the
+// settings that stay the same run after run — which provider to use, which
+// voice to speak in — do not have to be retyped every time. Command-line flags
+// always beat the file, and API keys deliberately have no place in it: those
+// belong in environment variables rather than a plaintext file in the home
+// directory.
+const configFileName = ".gospeak.json"
+
+// userHomeDir is wired through a package var so tests can point the default
+// config location at a temporary directory instead of the real home directory.
+var userHomeDir = os.UserHomeDir
+
+// providerConfig holds defaults that apply to a single provider. Voices are
+// provider-specific, so this is what lets one file name a preferred OpenAI
+// voice and a preferred Deepgram voice at the same time.
+type providerConfig struct {
+	Voice string   `json:"voice,omitempty"`
+	Model string   `json:"model,omitempty"`
+	Speed *float64 `json:"speed,omitempty"`
+}
+
+// config mirrors the on-disk file. Speed is a pointer so that an omitted speed
+// stays distinguishable from a deliberate 0, which is out of range for every
+// provider and should be reported rather than quietly replaced by the default.
+type config struct {
+	Provider  string                    `json:"provider,omitempty"`
+	Voice     string                    `json:"voice,omitempty"`
+	Model     string                    `json:"model,omitempty"`
+	Speed     *float64                  `json:"speed,omitempty"`
+	Providers map[string]providerConfig `json:"providers,omitempty"`
+
+	// path records where these settings were read from so an invalid value can
+	// point at the file that needs editing. Unexported, so encoding/json
+	// ignores it and it never becomes part of the file format.
+	path string
+}
+
+// forProvider returns the overrides for one provider, or a zero value when the
+// file says nothing about it.
+func (c *config) forProvider(name string) providerConfig {
+	return c.Providers[name]
+}
+
+// loadConfig reads the config file if there is one. A missing file at the
+// default location is not an error — most people will never write one — but a
+// file the user pointed at explicitly with --config or GOSPEAK_CONFIG is
+// expected to exist, and a malformed file is always reported rather than
+// silently ignored.
+func loadConfig(flagPath string, getenv func(string) string) (*config, error) {
+	path, explicit := flagPath, flagPath != ""
+	if path == "" {
+		if env := getenv("GOSPEAK_CONFIG"); env != "" {
+			path, explicit = env, true
+		}
+	}
+	if path == "" {
+		home, err := userHomeDir()
+		if err != nil {
+			// Nowhere to look amounts to the same thing as nothing to read.
+			return &config{}, nil
+		}
+		path = filepath.Join(home, configFileName)
+	}
+
+	data, err := os.ReadFile(path)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) && !explicit {
+			return &config{}, nil
+		}
+		return nil, fmt.Errorf("reading config %s: %w", path, err)
+	}
+
+	cfg := &config{path: path}
+	dec := json.NewDecoder(bytes.NewReader(data))
+	// Reject unknown keys rather than ignoring them: a setting that looks
+	// applied but silently is not is the worst way for a config file to fail.
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(cfg); err != nil {
+		return nil, fmt.Errorf("parsing config %s: %w", path, err)
+	}
+
+	if cfg.Provider != "" {
+		cfg.Provider = strings.ToLower(cfg.Provider)
+		if !isValidProvider(cfg.Provider) {
+			return nil, fmt.Errorf("config %s: invalid provider %q (use openai, elevenlabs, or deepgram)", path, cfg.Provider)
+		}
+	}
+	if len(cfg.Providers) > 0 {
+		byProvider := make(map[string]providerConfig, len(cfg.Providers))
+		for name, pc := range cfg.Providers {
+			lower := strings.ToLower(name)
+			if !isValidProvider(lower) {
+				return nil, fmt.Errorf("config %s: unknown provider %q under \"providers\" (use openai, elevenlabs, or deepgram)", path, name)
+			}
+			byProvider[lower] = pc
+		}
+		cfg.Providers = byProvider
+	}
+
+	return cfg, nil
+}
+
+// configOrigin renders the " (from <path>)" suffix used when a rejected
+// setting came out of the config file rather than off the command line, so the
+// error points at the thing that needs fixing.
+func configOrigin(cfg *config, fromConfig bool) string {
+	if !fromConfig || cfg.path == "" {
+		return ""
+	}
+	return fmt.Sprintf(" (from %s)", cfg.path)
+}
+
 func main() {
 	var stdin io.Reader = strings.NewReader("")
 	if stat, err := os.Stdin.Stat(); err == nil && (stat.Mode()&os.ModeCharDevice) == 0 {
@@ -184,6 +297,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		duration        float64
 		promptInfluence float64
 		loop            bool
+		configFile      string
+		noConfig        bool
 	)
 
 	fs := flag.NewFlagSet("gospeak", flag.ContinueOnError)
@@ -212,6 +327,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	fs.Float64Var(&duration, "d", 0, "Sound effect length in seconds (shorthand)")
 	fs.Float64Var(&promptInfluence, "influence", defaultPromptInfluence, "How closely the sound effect follows the prompt, 0.0-1.0")
 	fs.BoolVar(&loop, "loop", false, "Generate a seamlessly looping sound effect")
+	fs.StringVar(&configFile, "config", "", "Path to a config file (default: ~/.gospeak.json)")
+	fs.BoolVar(&noConfig, "no-config", false, "Ignore the config file")
 
 	fs.Usage = func() {
 		fmt.Fprintf(stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS API\n\n")
@@ -233,6 +350,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "                    omit or pass 0 to let the model decide)\n")
 		fmt.Fprintf(stderr, "      --influence   Prompt adherence, 0.0-1.0 (--sfx only)\n")
 		fmt.Fprintf(stderr, "      --loop        Make the sound effect loop seamlessly (--sfx only)\n")
+		fmt.Fprintf(stderr, "      --config      Path to a config file (default: ~/.gospeak.json)\n")
+		fmt.Fprintf(stderr, "      --no-config   Ignore the config file\n")
 		fmt.Fprintf(stderr, "  -h, --help        Show this help message\n\n")
 
 		fmt.Fprintf(stderr, "OpenAI:\n")
@@ -265,6 +384,22 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "           Aura 2: thalia, andromeda, helena, jason, apollo, ares\n")
 		fmt.Fprintf(stderr, "           (or use a model name directly like aura-asteria-en)\n")
 		fmt.Fprintf(stderr, "  Note:    Speed adjustment not supported\n\n")
+
+		fmt.Fprintf(stderr, "Config file (~/.gospeak.json):\n")
+		fmt.Fprintf(stderr, "  Optional JSON file holding the defaults every run starts from. Any flag\n")
+		fmt.Fprintf(stderr, "  you type overrides it. API keys stay in environment variables.\n")
+		fmt.Fprintf(stderr, "    {\n")
+		fmt.Fprintf(stderr, "      \"provider\": \"elevenlabs\",\n")
+		fmt.Fprintf(stderr, "      \"voice\": \"josh\",\n")
+		fmt.Fprintf(stderr, "      \"model\": \"eleven_turbo_v2_5\",\n")
+		fmt.Fprintf(stderr, "      \"speed\": 1.0,\n")
+		fmt.Fprintf(stderr, "      \"providers\": {\n")
+		fmt.Fprintf(stderr, "        \"openai\":   { \"voice\": \"nova\" },\n")
+		fmt.Fprintf(stderr, "        \"deepgram\": { \"voice\": \"thalia\" }\n")
+		fmt.Fprintf(stderr, "      }\n")
+		fmt.Fprintf(stderr, "    }\n")
+		fmt.Fprintf(stderr, "  A \"providers\" entry beats the file-wide setting for that provider.\n")
+		fmt.Fprintf(stderr, "  Point elsewhere with --config <path> or GOSPEAK_CONFIG.\n\n")
 
 		fmt.Fprintf(stderr, "Examples:\n")
 		fmt.Fprintf(stderr, "  gospeak \"Hello, world!\"\n")
@@ -299,6 +434,24 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		return false
 	}
 
+	if noConfig && wasSet("config") {
+		fmt.Fprintln(stderr, "Warning: --config is ignored when --no-config is set")
+	}
+	cfg := &config{}
+	if !noConfig {
+		loaded, err := loadConfig(configFile, getenv)
+		if err != nil {
+			fmt.Fprintf(stderr, "Error: %v\n", err)
+			return 1
+		}
+		cfg = loaded
+	}
+
+	// A provider named in the config file is a default like any other: -p still
+	// wins, and --sfx still forces ElevenLabs below.
+	if !wasSet("provider", "p") && cfg.Provider != "" {
+		provider = cfg.Provider
+	}
 	provider = strings.ToLower(provider)
 
 	if sfx {
@@ -330,9 +483,40 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		}
 	}
 
-	if provider != "openai" && provider != "elevenlabs" && provider != "deepgram" {
+	if !isValidProvider(provider) {
 		fmt.Fprintf(stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', or 'deepgram'\n", provider)
 		return 1
+	}
+
+	// Config-file defaults fill in whatever the command line left unset, with a
+	// provider-specific entry beating the file-wide one. Sound effects skip all
+	// of this: voice, model and speed describe speech, and --sfx already ignores
+	// the flags that carry them.
+	pc := cfg.forProvider(provider)
+	voiceFromConfig := false
+	speedFromProviderConfig := false
+	if !sfx {
+		if voice == "" {
+			if pc.Voice != "" {
+				voice, voiceFromConfig = pc.Voice, true
+			} else if cfg.Voice != "" {
+				voice, voiceFromConfig = cfg.Voice, true
+			}
+		}
+		if model == "" {
+			if pc.Model != "" {
+				model = pc.Model
+			} else if cfg.Model != "" {
+				model = cfg.Model
+			}
+		}
+		if !wasSet("speed", "x") {
+			if pc.Speed != nil {
+				speed, speedFromProviderConfig = *pc.Speed, true
+			} else if cfg.Speed != nil {
+				speed = *cfg.Speed
+			}
+		}
 	}
 
 	if voice == "" {
@@ -405,7 +589,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 				return 1
 			}
 		case "deepgram":
-			if speed != defaultSpeed {
+			// A speed aimed at Deepgram — typed on the command line, or set in
+			// the file's own deepgram section — earns a warning. A file-wide
+			// default that simply does not apply here does not: nagging about it
+			// on every Deepgram run would be noise, not information.
+			if speed != defaultSpeed && (wasSet("speed", "x") || speedFromProviderConfig) {
 				fmt.Fprintln(stderr, "Warning: Speed adjustment is not supported for Deepgram, ignoring")
 			}
 		}
@@ -484,7 +672,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		})
 	case provider == "openai":
 		if !isValidOpenAIVoice(voice) {
-			fmt.Fprintf(stderr, "Error: Invalid OpenAI voice '%s'. Valid voices: %s\n", voice, strings.Join(openAIVoices, ", "))
+			fmt.Fprintf(stderr, "Error: Invalid OpenAI voice '%s'%s. Valid voices: %s\n",
+				voice, configOrigin(cfg, voiceFromConfig), strings.Join(openAIVoices, ", "))
 			return 1
 		}
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
@@ -536,6 +725,10 @@ func flagName(name string) string {
 		return "-" + name
 	}
 	return "--" + name
+}
+
+func isValidProvider(provider string) bool {
+	return provider == "openai" || provider == "elevenlabs" || provider == "deepgram"
 }
 
 func isValidOpenAIVoice(voice string) bool {

@@ -5,6 +5,7 @@ A self-contained command-line tool for text-to-speech using OpenAI, ElevenLabs, 
 ## Features
 
 - **Multiple TTS providers**: OpenAI, ElevenLabs, and Deepgram
+- **Config file** - set your default provider and voice once in `~/.gospeak.json`
 - **Sound effects** - generate audio from a text description with `--sfx` (ElevenLabs)
 - **No ffmpeg required** - uses native Go audio libraries
 - **Auto-chunking for long text** - splits on paragraph/sentence boundaries and joins the audio so multi-paragraph input never hits a per-request timeout
@@ -66,6 +67,94 @@ export DEEPGRAM_API_KEY="your-deepgram-api-key"
 ```
 
 Or pass the key directly with the `--token` flag.
+
+## Config File
+
+Typing `-p elevenlabs -v josh` on every run gets old. Drop a `~/.gospeak.json`
+in your home directory and gospeak will start from those defaults instead:
+
+```json
+{
+  "provider": "elevenlabs",
+  "voice": "josh"
+}
+```
+
+Now `gospeak "Hello"` speaks with Josh on ElevenLabs, and `gospeak -v rachel
+"Hello"` still works — **anything you type on the command line beats the file.**
+
+### Every setting
+
+```json
+{
+  "provider": "elevenlabs",
+  "voice": "josh",
+  "model": "eleven_turbo_v2_5",
+  "speed": 1.0,
+
+  "providers": {
+    "openai":     { "voice": "nova", "model": "tts-1" },
+    "elevenlabs": { "voice": "josh", "speed": 1.1 },
+    "deepgram":   { "voice": "thalia" }
+  }
+}
+```
+
+| Key | Meaning |
+|-----|---------|
+| `provider` | Default provider: `openai`, `elevenlabs`, or `deepgram` |
+| `voice` | Default voice, used for whichever provider is in play |
+| `model` | Default model |
+| `speed` | Default speech speed |
+| `providers.<name>` | Overrides that apply to that one provider — `voice`, `model`, `speed` |
+
+Every key is optional. Anything you leave out falls back to gospeak's built-in
+default for the provider you end up using.
+
+### Which value wins
+
+For each setting, gospeak takes the first of these that exists:
+
+1. The command-line flag
+2. The `providers.<name>` entry for the provider being used
+3. The file-wide setting
+4. gospeak's built-in default
+
+Voices are provider-specific, so the `providers` block is how one file names a
+preferred voice for each of them. A file-wide `"voice": "josh"` will be handed
+to whatever provider you run — useful when you only ever use one, but it means
+`gospeak -p openai` would try to speak with `josh` and be told there is no such
+OpenAI voice. Put per-provider voices under `providers` and that stops being a
+concern.
+
+### Other locations
+
+```bash
+# Use a different file for one run
+gospeak --config ./project-voice.json "Hello"
+
+# Or set it for the whole shell
+export GOSPEAK_CONFIG=~/.config/gospeak.json
+
+# Ignore the config file entirely - handy in scripts that must be predictable
+gospeak --no-config "Hello"
+```
+
+`--config` beats `GOSPEAK_CONFIG`, which beats `~/.gospeak.json`. A missing
+`~/.gospeak.json` is perfectly normal and silently ignored; a file you named
+explicitly is expected to exist.
+
+### Notes
+
+- **API keys do not go in the config file.** They stay in environment variables
+  (or `--token`), where they are not sitting in a plaintext file in your home
+  directory.
+- **Unknown keys are an error, not a shrug.** Misspell `provider` as `provdier`
+  and gospeak tells you, rather than silently ignoring a setting you think is
+  applied.
+- **`--sfx` ignores `voice`, `model` and `speed`** from the file, the same way it
+  ignores those flags — they describe speech, not sound effects. A `provider` in
+  the file does not stop `--sfx` from switching to ElevenLabs.
 
 ## Usage
 
@@ -260,6 +349,8 @@ gospeak -p elevenlabs -m eleven_turbo_v2_5 "Turbo model"
 | `--duration` | `-d` | Sound effect length in seconds, 0.5-30, or 0 for auto (`--sfx` only) | model decides |
 | `--influence` | - | Prompt adherence, 0.0-1.0 (`--sfx` only) | `0.3` |
 | `--loop` | - | Make the sound effect loop seamlessly (`--sfx` only) | `false` |
+| `--config` | - | Path to a config file | `~/.gospeak.json` |
+| `--no-config` | - | Ignore the config file | `false` |
 | `--help` | `-h` | Show help message | - |
 
 ## Provider Comparison
@@ -358,6 +449,9 @@ Error: --sfx is only supported by the elevenlabs provider (got 'openai')
 Error: Duration must be between 0.5 and 30 seconds
 Error: Influence must be between 0.0 and 1.0
 Error: --all cannot be combined with --sfx
+Error: parsing config /Users/you/.gospeak.json: json: unknown field "provdier"
+Error: config /Users/you/.gospeak.json: invalid provider "azure" (use openai, elevenlabs, or deepgram)
+Error: Invalid OpenAI voice 'josh' (from /Users/you/.gospeak.json). Valid voices: alloy, echo, ...
 ```
 
 ## Help

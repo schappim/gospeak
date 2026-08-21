@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -685,12 +687,25 @@ func TestMain(m *testing.M) {
 		main()
 		return
 	}
-	os.Exit(m.Run())
+	// Point the config lookup at an empty directory so a real ~/.gospeak.json on
+	// the machine running the suite cannot change what any of these tests see.
+	// Tests that want a config file install their own userHomeDir or pass
+	// --config.
+	emptyHome, err := os.MkdirTemp("", "gospeak-no-config")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to create config-free home: %v\n", err)
+		os.Exit(1)
+	}
+	userHomeDir = func() (string, error) { return emptyHome, nil }
+	code := m.Run()
+	_ = os.RemoveAll(emptyHome)
+	os.Exit(code)
 }
 
 func TestMainEntryPoint_NoArgsExitsOne(t *testing.T) {
 	cmd := exec.Command(os.Args[0])
-	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1", "OPENAI_API_KEY=")
+	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1", "OPENAI_API_KEY=",
+		"HOME="+t.TempDir(), "GOSPEAK_CONFIG=")
 	cmd.Stdin = strings.NewReader("") // simulate no piped input
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -713,7 +728,8 @@ func TestMainEntryPoint_NoArgsExitsOne(t *testing.T) {
 
 func TestMainEntryPoint_HelpExitsZero(t *testing.T) {
 	cmd := exec.Command(os.Args[0], "--help")
-	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1")
+	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1",
+		"HOME="+t.TempDir(), "GOSPEAK_CONFIG=")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 
@@ -730,7 +746,8 @@ func TestMainEntryPoint_PipedStdinReachesRun(t *testing.T) {
 	// through the real main() — exercises the os.Stdin.Stat non-character
 	// device branch that resolves stdin to the pipe.
 	cmd := exec.Command(os.Args[0], "-p", "openai")
-	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1", "OPENAI_API_KEY=")
+	cmd.Env = append(os.Environ(), "GOSPEAK_TEST_BINARY=1", "OPENAI_API_KEY=",
+		"HOME="+t.TempDir(), "GOSPEAK_CONFIG=")
 	cmd.Stdin = strings.NewReader("from a real pipe")
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
@@ -2153,6 +2170,714 @@ func TestFlagName(t *testing.T) {
 	for _, c := range cases {
 		if got := flagName(c.in); got != c.want {
 			t.Errorf("flagName(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+// --- Config file -----------------------------------------------------------
+
+// writeConfigFile drops a config file into a fresh temp directory and returns
+// its path, for the cases that point --config or GOSPEAK_CONFIG at it.
+func writeConfigFile(t *testing.T, contents string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), configFileName)
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("writing config file: %v", err)
+	}
+	return path
+}
+
+// useHomeConfig installs a home directory holding the given config file for the
+// duration of the test, so the default lookup finds it.
+func useHomeConfig(t *testing.T, contents string) string {
+	t.Helper()
+	home := t.TempDir()
+	path := filepath.Join(home, configFileName)
+	if err := os.WriteFile(path, []byte(contents), 0o644); err != nil {
+		t.Fatalf("writing config file: %v", err)
+	}
+	original := userHomeDir
+	userHomeDir = func() (string, error) { return home, nil }
+	t.Cleanup(func() { userHomeDir = original })
+	return path
+}
+
+// recordedRequest holds what a stub provider endpoint was sent.
+type recordedRequest struct {
+	body []byte
+	url  string
+}
+
+// recordProvider repoints a provider endpoint at a server that records the
+// request and replies with a stub MP3, so tests can assert on the settings that
+// actually reached the wire.
+func recordProvider(t *testing.T, target *string) *recordedRequest {
+	t.Helper()
+	rec := &recordedRequest{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rec.body, _ = io.ReadAll(r.Body)
+		rec.url = r.URL.String()
+		_, _ = w.Write([]byte{0xFF, 0xFB, 0x00, 0x00})
+	}))
+	t.Cleanup(srv.Close)
+	restore := swapURL(target, srv.URL)
+	t.Cleanup(restore)
+	return rec
+}
+
+// decodeOpenAI unpacks a recorded OpenAI request body.
+func (r *recordedRequest) decodeOpenAI(t *testing.T) OpenAITTSRequest {
+	t.Helper()
+	var req OpenAITTSRequest
+	if err := json.Unmarshal(r.body, &req); err != nil {
+		t.Fatalf("decoding recorded request %q: %v", r.body, err)
+	}
+	return req
+}
+
+// decodeElevenLabs unpacks a recorded ElevenLabs request body.
+func (r *recordedRequest) decodeElevenLabs(t *testing.T) ElevenLabsTTSRequest {
+	t.Helper()
+	var req ElevenLabsTTSRequest
+	if err := json.Unmarshal(r.body, &req); err != nil {
+		t.Fatalf("decoding recorded request %q: %v", r.body, err)
+	}
+	return req
+}
+
+func TestIsValidProvider(t *testing.T) {
+	for _, valid := range []string{"openai", "elevenlabs", "deepgram"} {
+		if !isValidProvider(valid) {
+			t.Errorf("isValidProvider(%q) = false, want true", valid)
+		}
+	}
+	for _, invalid := range []string{"", "OpenAI", "azure", "openai "} {
+		if isValidProvider(invalid) {
+			t.Errorf("isValidProvider(%q) = true, want false", invalid)
+		}
+	}
+}
+
+func TestLoadConfig_MissingDefaultFileIsNotAnError(t *testing.T) {
+	original := userHomeDir
+	userHomeDir = func() (string, error) { return t.TempDir(), nil }
+	defer func() { userHomeDir = original }()
+
+	cfg, err := loadConfig("", emptyEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Provider != "" || cfg.Voice != "" || cfg.path != "" {
+		t.Fatalf("expected an empty config, got %+v", cfg)
+	}
+}
+
+func TestLoadConfig_NoHomeDirectoryIsNotAnError(t *testing.T) {
+	original := userHomeDir
+	userHomeDir = func() (string, error) { return "", errors.New("no home here") }
+	defer func() { userHomeDir = original }()
+
+	cfg, err := loadConfig("", emptyEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Provider != "" {
+		t.Fatalf("expected an empty config, got %+v", cfg)
+	}
+}
+
+func TestLoadConfig_ReadsHomeDirectoryFile(t *testing.T) {
+	path := useHomeConfig(t, `{"provider": "deepgram", "voice": "thalia"}`)
+
+	cfg, err := loadConfig("", emptyEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Provider != "deepgram" {
+		t.Errorf("provider = %q, want deepgram", cfg.Provider)
+	}
+	if cfg.Voice != "thalia" {
+		t.Errorf("voice = %q, want thalia", cfg.Voice)
+	}
+	if cfg.path != path {
+		t.Errorf("path = %q, want %q", cfg.path, path)
+	}
+}
+
+func TestLoadConfig_FlagPathBeatsEnvAndHome(t *testing.T) {
+	useHomeConfig(t, `{"voice": "from-home"}`)
+	envPath := writeConfigFile(t, `{"voice": "from-env"}`)
+	flagPath := writeConfigFile(t, `{"voice": "from-flag"}`)
+
+	cfg, err := loadConfig(flagPath, envMap(map[string]string{"GOSPEAK_CONFIG": envPath}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Voice != "from-flag" {
+		t.Fatalf("voice = %q, want from-flag", cfg.Voice)
+	}
+}
+
+func TestLoadConfig_EnvPathBeatsHome(t *testing.T) {
+	useHomeConfig(t, `{"voice": "from-home"}`)
+	envPath := writeConfigFile(t, `{"voice": "from-env"}`)
+
+	cfg, err := loadConfig("", envMap(map[string]string{"GOSPEAK_CONFIG": envPath}))
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Voice != "from-env" {
+		t.Fatalf("voice = %q, want from-env", cfg.Voice)
+	}
+}
+
+func TestLoadConfig_MissingExplicitFileIsAnError(t *testing.T) {
+	missing := filepath.Join(t.TempDir(), "nope.json")
+
+	t.Run("flag", func(t *testing.T) {
+		if _, err := loadConfig(missing, emptyEnv); err == nil {
+			t.Fatal("expected an error for a --config path that does not exist")
+		} else if !strings.Contains(err.Error(), missing) {
+			t.Fatalf("expected the path in the error, got %v", err)
+		}
+	})
+
+	t.Run("env", func(t *testing.T) {
+		_, err := loadConfig("", envMap(map[string]string{"GOSPEAK_CONFIG": missing}))
+		if err == nil {
+			t.Fatal("expected an error for a GOSPEAK_CONFIG path that does not exist")
+		}
+	})
+}
+
+func TestLoadConfig_UnreadableFileIsAnError(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a mode-0 file, so there is nothing to test")
+	}
+	path := writeConfigFile(t, `{"voice": "nova"}`)
+	if err := os.Chmod(path, 0o000); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	defer func() { _ = os.Chmod(path, 0o644) }()
+
+	if _, err := loadConfig(path, emptyEnv); err == nil {
+		t.Fatal("expected a read error for an unreadable config file")
+	} else if !strings.Contains(err.Error(), "reading config") {
+		t.Fatalf("expected a read-stage error, got %v", err)
+	}
+}
+
+func TestLoadConfig_RejectsMalformedJSON(t *testing.T) {
+	path := writeConfigFile(t, `{"provider": "openai",}`)
+
+	_, err := loadConfig(path, emptyEnv)
+	if err == nil {
+		t.Fatal("expected an error for malformed JSON")
+	}
+	if !strings.Contains(err.Error(), "parsing config") {
+		t.Fatalf("expected a parse-stage error, got %v", err)
+	}
+}
+
+func TestLoadConfig_RejectsUnknownField(t *testing.T) {
+	// A typo'd key must be reported: a setting that looks applied but is not is
+	// the failure mode this guards against.
+	path := writeConfigFile(t, `{"provdier": "openai"}`)
+
+	_, err := loadConfig(path, emptyEnv)
+	if err == nil {
+		t.Fatal("expected an error for an unknown field")
+	}
+	if !strings.Contains(err.Error(), "provdier") {
+		t.Fatalf("expected the offending key in the error, got %v", err)
+	}
+}
+
+func TestLoadConfig_RejectsInvalidProvider(t *testing.T) {
+	path := writeConfigFile(t, `{"provider": "azure"}`)
+
+	_, err := loadConfig(path, emptyEnv)
+	if err == nil {
+		t.Fatal("expected an error for an unknown provider")
+	}
+	if !strings.Contains(err.Error(), "azure") || !strings.Contains(err.Error(), path) {
+		t.Fatalf("expected provider and path in the error, got %v", err)
+	}
+}
+
+func TestLoadConfig_RejectsUnknownProviderSection(t *testing.T) {
+	path := writeConfigFile(t, `{"providers": {"azure": {"voice": "nova"}}}`)
+
+	_, err := loadConfig(path, emptyEnv)
+	if err == nil {
+		t.Fatal("expected an error for an unknown providers section")
+	}
+	if !strings.Contains(err.Error(), "azure") {
+		t.Fatalf("expected the section name in the error, got %v", err)
+	}
+}
+
+func TestLoadConfig_LowercasesProviderNames(t *testing.T) {
+	path := writeConfigFile(t, `{"provider": "ElevenLabs", "providers": {"OpenAI": {"voice": "nova"}}}`)
+
+	cfg, err := loadConfig(path, emptyEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Provider != "elevenlabs" {
+		t.Errorf("provider = %q, want elevenlabs", cfg.Provider)
+	}
+	if got := cfg.forProvider("openai").Voice; got != "nova" {
+		t.Errorf("openai voice = %q, want nova", got)
+	}
+}
+
+func TestLoadConfig_ReadsEveryField(t *testing.T) {
+	path := writeConfigFile(t, `{
+		"provider": "elevenlabs",
+		"voice": "josh",
+		"model": "eleven_turbo_v2_5",
+		"speed": 1.1,
+		"providers": {
+			"openai": {"voice": "nova", "model": "tts-1", "speed": 2.0}
+		}
+	}`)
+
+	cfg, err := loadConfig(path, emptyEnv)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.Model != "eleven_turbo_v2_5" {
+		t.Errorf("model = %q, want eleven_turbo_v2_5", cfg.Model)
+	}
+	if cfg.Speed == nil || *cfg.Speed != 1.1 {
+		t.Errorf("speed = %v, want 1.1", cfg.Speed)
+	}
+	openai := cfg.forProvider("openai")
+	if openai.Voice != "nova" || openai.Model != "tts-1" {
+		t.Errorf("openai section = %+v, want nova/tts-1", openai)
+	}
+	if openai.Speed == nil || *openai.Speed != 2.0 {
+		t.Errorf("openai speed = %v, want 2.0", openai.Speed)
+	}
+}
+
+func TestConfig_ForProviderOnEmptyConfigIsZeroValue(t *testing.T) {
+	cfg := &config{}
+	if got := cfg.forProvider("openai"); got != (providerConfig{}) {
+		t.Fatalf("forProvider on an empty config = %+v, want zero value", got)
+	}
+}
+
+func TestConfigOrigin(t *testing.T) {
+	cfg := &config{path: "/home/me/.gospeak.json"}
+	if got := configOrigin(cfg, true); got != " (from /home/me/.gospeak.json)" {
+		t.Errorf("configOrigin = %q", got)
+	}
+	if got := configOrigin(cfg, false); got != "" {
+		t.Errorf("configOrigin for a non-config value = %q, want empty", got)
+	}
+	if got := configOrigin(&config{}, true); got != "" {
+		t.Errorf("configOrigin with no path = %q, want empty", got)
+	}
+}
+
+func TestRun_ConfigProvidesDefaultProvider(t *testing.T) {
+	useHomeConfig(t, `{"provider": "elevenlabs"}`)
+	rec := recordProvider(t, &elevenLabsAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "", envMap(map[string]string{
+		"ELEVENLABS_API_KEY": "k",
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if rec.body == nil {
+		t.Fatal("expected the ElevenLabs endpoint to be called")
+	}
+}
+
+func TestRun_ProviderFlagBeatsConfig(t *testing.T) {
+	useHomeConfig(t, `{"provider": "elevenlabs", "voice": "josh"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-p", "openai", "-v", "nova", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Voice; got != "nova" {
+		t.Fatalf("voice = %q, want nova", got)
+	}
+}
+
+func TestRun_ConfigProvidesDefaultVoice(t *testing.T) {
+	useHomeConfig(t, `{"voice": "shimmer"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Voice; got != "shimmer" {
+		t.Fatalf("voice = %q, want shimmer", got)
+	}
+}
+
+func TestRun_VoiceFlagBeatsConfig(t *testing.T) {
+	useHomeConfig(t, `{"voice": "shimmer"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-v", "echo", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Voice; got != "echo" {
+		t.Fatalf("voice = %q, want echo", got)
+	}
+}
+
+func TestRun_ProviderSectionVoiceBeatsFileWideVoice(t *testing.T) {
+	// The point of the per-provider section: a file-wide voice that belongs to
+	// another provider must not leak into this one.
+	useHomeConfig(t, `{"voice": "josh", "providers": {"openai": {"voice": "onyx"}}}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Voice; got != "onyx" {
+		t.Fatalf("voice = %q, want onyx", got)
+	}
+}
+
+func TestRun_ConfigVoiceResolvesElevenLabsPreset(t *testing.T) {
+	useHomeConfig(t, `{"provider": "elevenlabs", "voice": "josh"}`)
+	rec := recordProvider(t, &elevenLabsAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if want := elevenLabsVoices["josh"]; !strings.Contains(rec.url, want) {
+		t.Fatalf("request URL = %q, want it to carry voice_id %q", rec.url, want)
+	}
+}
+
+func TestRun_ConfigVoiceResolvesDeepgramPreset(t *testing.T) {
+	useHomeConfig(t, `{"provider": "deepgram", "providers": {"deepgram": {"voice": "thalia"}}}`)
+	rec := recordProvider(t, &deepgramAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "",
+		envMap(map[string]string{"DEEPGRAM_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(rec.url, "aura-2-thalia-en") {
+		t.Fatalf("request URL = %q, want it to carry aura-2-thalia-en", rec.url)
+	}
+}
+
+func TestRun_ConfigProvidesDefaultModel(t *testing.T) {
+	useHomeConfig(t, `{"model": "tts-1", "providers": {"elevenlabs": {"model": "eleven_turbo_v2_5"}}}`)
+
+	t.Run("file-wide", func(t *testing.T) {
+		rec := recordProvider(t, &openAIAPIURL)
+		out := filepath.Join(t.TempDir(), "out.mp3")
+		code, stderr := runCLI(t, []string{"-o", out, "hello"}, "",
+			envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+		}
+		if got := rec.decodeOpenAI(t).Model; got != "tts-1" {
+			t.Fatalf("model = %q, want tts-1", got)
+		}
+	})
+
+	t.Run("provider section", func(t *testing.T) {
+		rec := recordProvider(t, &elevenLabsAPIURL)
+		out := filepath.Join(t.TempDir(), "out.mp3")
+		code, stderr := runCLI(t, []string{"-p", "elevenlabs", "-o", out, "hello"}, "",
+			envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+		}
+		if got := rec.decodeElevenLabs(t).ModelID; got != "eleven_turbo_v2_5" {
+			t.Fatalf("model = %q, want eleven_turbo_v2_5", got)
+		}
+	})
+
+	t.Run("flag wins", func(t *testing.T) {
+		rec := recordProvider(t, &openAIAPIURL)
+		out := filepath.Join(t.TempDir(), "out.mp3")
+		code, stderr := runCLI(t, []string{"-m", "tts-1-hd", "-o", out, "hello"}, "",
+			envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+		if code != 0 {
+			t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+		}
+		if got := rec.decodeOpenAI(t).Model; got != "tts-1-hd" {
+			t.Fatalf("model = %q, want tts-1-hd", got)
+		}
+	})
+}
+
+func TestRun_ConfigProvidesDefaultSpeed(t *testing.T) {
+	useHomeConfig(t, `{"speed": 1.75}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Speed; got != 1.75 {
+		t.Fatalf("speed = %v, want 1.75", got)
+	}
+}
+
+func TestRun_SpeedFlagBeatsConfig(t *testing.T) {
+	useHomeConfig(t, `{"speed": 1.75}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-x", "0.5", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Speed; got != 0.5 {
+		t.Fatalf("speed = %v, want 0.5", got)
+	}
+}
+
+func TestRun_ConfigSpeedOutOfRangeIsRejected(t *testing.T) {
+	useHomeConfig(t, `{"provider": "elevenlabs", "speed": 3.0}`)
+
+	code, stderr := runCLI(t, []string{"hello"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "0.7 and 1.2") {
+		t.Fatalf("expected the speed-range error, got %q", stderr)
+	}
+}
+
+func TestRun_DeepgramStaysQuietAboutFileWideSpeed(t *testing.T) {
+	// A file-wide speed aimed at the user's usual provider is not a Deepgram
+	// mistake, so warning about it on every Deepgram run would be noise.
+	useHomeConfig(t, `{"speed": 1.5}`)
+	recordProvider(t, &deepgramAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-p", "deepgram", "-o", out, "hello"}, "",
+		envMap(map[string]string{"DEEPGRAM_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if strings.Contains(stderr, "Speed adjustment is not supported") {
+		t.Fatalf("did not expect a speed warning, got %q", stderr)
+	}
+}
+
+func TestRun_DeepgramWarnsAboutSpeedInItsOwnSection(t *testing.T) {
+	useHomeConfig(t, `{"providers": {"deepgram": {"speed": 1.5}}}`)
+	recordProvider(t, &deepgramAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-p", "deepgram", "-o", out, "hello"}, "",
+		envMap(map[string]string{"DEEPGRAM_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "Speed adjustment is not supported") {
+		t.Fatalf("expected a speed warning, got %q", stderr)
+	}
+}
+
+func TestRun_InvalidConfigReturnsOne(t *testing.T) {
+	path := useHomeConfig(t, `{"provider": "azure"}`)
+
+	code, stderr := runCLI(t, []string{"hello"}, "", emptyEnv)
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, path) {
+		t.Fatalf("expected the config path in the error, got %q", stderr)
+	}
+}
+
+func TestRun_InvalidConfigVoiceNamesTheFile(t *testing.T) {
+	// An OpenAI voice that came out of the config file should point the user at
+	// the file rather than looking like a mistyped flag.
+	path := useHomeConfig(t, `{"voice": "josh"}`)
+
+	code, stderr := runCLI(t, []string{"hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if !strings.Contains(stderr, "Invalid OpenAI voice 'josh'") {
+		t.Fatalf("expected the invalid-voice error, got %q", stderr)
+	}
+	if !strings.Contains(stderr, "(from "+path+")") {
+		t.Fatalf("expected the config path in the error, got %q", stderr)
+	}
+}
+
+func TestRun_InvalidFlagVoiceDoesNotBlameTheConfig(t *testing.T) {
+	path := useHomeConfig(t, `{"voice": "nova"}`)
+
+	code, stderr := runCLI(t, []string{"-v", "josh", "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 1 {
+		t.Fatalf("exit code = %d, want 1", code)
+	}
+	if strings.Contains(stderr, path) {
+		t.Fatalf("a voice typed on the command line should not blame the config, got %q", stderr)
+	}
+}
+
+func TestRun_NoConfigIgnoresTheFile(t *testing.T) {
+	useHomeConfig(t, `{"provider": "elevenlabs", "voice": "josh"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"--no-config", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k", "ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Voice; got != defaultOpenAIVoice {
+		t.Fatalf("voice = %q, want the built-in default %q", got, defaultOpenAIVoice)
+	}
+}
+
+func TestRun_NoConfigSkipsAnUnreadableFile(t *testing.T) {
+	// --no-config has to short-circuit the load, not just discard the result.
+	useHomeConfig(t, `{"provider": "azure"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"--no-config", "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if rec.body == nil {
+		t.Fatal("expected the OpenAI endpoint to be called")
+	}
+}
+
+func TestRun_NoConfigWarnsWhenConfigPathAlsoGiven(t *testing.T) {
+	path := writeConfigFile(t, `{"voice": "nova"}`)
+	recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"--no-config", "--config", path, "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "--config is ignored when --no-config is set") {
+		t.Fatalf("expected the contradiction warning, got %q", stderr)
+	}
+}
+
+func TestRun_ConfigFlagPointsAtAnotherFile(t *testing.T) {
+	useHomeConfig(t, `{"voice": "shimmer"}`)
+	path := writeConfigFile(t, `{"voice": "fable"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"--config", path, "-o", out, "hello"}, "",
+		envMap(map[string]string{"OPENAI_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Voice; got != "fable" {
+		t.Fatalf("voice = %q, want fable", got)
+	}
+}
+
+func TestRun_ConfigPathFromEnvironment(t *testing.T) {
+	path := writeConfigFile(t, `{"voice": "onyx"}`)
+	rec := recordProvider(t, &openAIAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"-o", out, "hello"}, "", envMap(map[string]string{
+		"OPENAI_API_KEY": "k",
+		"GOSPEAK_CONFIG": path,
+	}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if got := rec.decodeOpenAI(t).Voice; got != "onyx" {
+		t.Fatalf("voice = %q, want onyx", got)
+	}
+}
+
+func TestRun_SFXIgnoresConfigSpeechSettings(t *testing.T) {
+	// Voice, model and speed describe speech. --sfx already ignores the flags
+	// that carry them, so the config file's versions have to be ignored too —
+	// a speech model would be rejected by the sound-generation endpoint.
+	useHomeConfig(t, `{"provider": "openai", "voice": "nova", "model": "tts-1-hd", "speed": 2.0}`)
+	rec := recordProvider(t, &elevenLabsSFXAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"--sfx", "-o", out, "a bell"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	var req ElevenLabsSFXRequest
+	if err := json.Unmarshal(rec.body, &req); err != nil {
+		t.Fatalf("decoding recorded request %q: %v", rec.body, err)
+	}
+	if req.ModelID != defaultSFXModel {
+		t.Fatalf("model = %q, want %q", req.ModelID, defaultSFXModel)
+	}
+}
+
+func TestRun_SFXOverridesConfigProviderWithoutComplaining(t *testing.T) {
+	// A provider from the config file is a standing default, not a per-run
+	// request, so --sfx switches to ElevenLabs silently. Only an explicit -p
+	// for another provider is an error.
+	useHomeConfig(t, `{"provider": "openai"}`)
+	recordProvider(t, &elevenLabsSFXAPIURL)
+
+	out := filepath.Join(t.TempDir(), "out.mp3")
+	code, stderr := runCLI(t, []string{"--sfx", "-o", out, "a bell"}, "",
+		envMap(map[string]string{"ELEVENLABS_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if strings.Contains(stderr, "only supported by the elevenlabs provider") {
+		t.Fatalf("did not expect a provider complaint, got %q", stderr)
+	}
+}
+
+func TestRun_HelpDocumentsTheConfigFile(t *testing.T) {
+	code, stderr := runCLI(t, []string{"--help"}, "", emptyEnv)
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0", code)
+	}
+	for _, want := range []string{"--config", "--no-config", configFileName, "GOSPEAK_CONFIG"} {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("expected %q in the help output", want)
 		}
 	}
 }
