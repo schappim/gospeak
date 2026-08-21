@@ -564,6 +564,28 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		}
 	}
 
+	// A voice the provider does not have, or a model that cannot speak the
+	// voice, is a mistake in the arguments themselves. Report it before
+	// anything that depends on the environment, so the user hears about the
+	// real problem rather than a missing API key.
+	if !sfx && provider == "openai" {
+		if !isValidOpenAIVoice(voice) {
+			fmt.Fprintf(stderr, "Error: Invalid OpenAI voice '%s'%s. Valid voices: %s\n",
+				voice, configOrigin(cfg, voiceFromConfig), strings.Join(openAIVoices, ", "))
+			return 1
+		}
+		// The model is a means to the voice, so a default or a config entry
+		// yields to whatever the voice actually needs. A model typed on the
+		// command line is a real instruction, and a contradiction is reported
+		// rather than quietly overridden.
+		if openAIAllVoiceModelOnly[voice] && !speaksEveryOpenAIVoice(model) && wasSet("model", "m") {
+			fmt.Fprintf(stderr, "Error: Voice '%s' needs the %s model, which '%s' is not. Drop -m, or pass -m %s\n",
+				voice, openAIAllVoiceModel, model, openAIAllVoiceModel)
+			return 1
+		}
+		model = openAIModelForVoice(model, voice)
+	}
+
 	apiKey := token
 	if apiKey == "" {
 		switch provider {
@@ -697,21 +719,6 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			return synthesizeSoundEffect(apiKey, model, text, durationSeconds, promptInfluence, loop)
 		})
 	case provider == "openai":
-		if !isValidOpenAIVoice(voice) {
-			fmt.Fprintf(stderr, "Error: Invalid OpenAI voice '%s'%s. Valid voices: %s\n",
-				voice, configOrigin(cfg, voiceFromConfig), strings.Join(openAIVoices, ", "))
-			return 1
-		}
-		// The model is a means to the voice, so a default or a config entry
-		// yields to whatever the voice actually needs. A model typed on the
-		// command line is a real instruction, and a contradiction is reported
-		// rather than quietly overridden.
-		if openAIAllVoiceModelOnly[voice] && !speaksEveryOpenAIVoice(model) && wasSet("model", "m") {
-			fmt.Fprintf(stderr, "Error: Voice '%s' needs the %s model, which '%s' is not. Drop -m, or pass -m %s\n",
-				voice, openAIAllVoiceModel, model, openAIAllVoiceModel)
-			return 1
-		}
-		model = openAIModelForVoice(model, voice)
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeOpenAI(apiKey, model, voice, chunk, speed)
 		})

@@ -3056,3 +3056,31 @@ func TestRun_HelpListsTheNewerVoices(t *testing.T) {
 		}
 	}
 }
+
+func TestRun_ArgumentMistakesReportBeforeTheMissingKey(t *testing.T) {
+	// A voice the provider does not have, or a model that cannot speak it, is a
+	// mistake in the arguments. Reporting the missing API key first would send
+	// the user off fixing the wrong thing.
+	cases := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{"unknown voice", []string{"-v", "not-a-voice", "hello"}, "Invalid OpenAI voice"},
+		{"model cannot speak the voice", []string{"-v", "marin", "-m", "tts-1-hd", "hello"}, "gpt-4o-mini-tts"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			code, stderr := runCLI(t, c.args, "", emptyEnv)
+			if code != 1 {
+				t.Fatalf("exit code = %d, want 1", code)
+			}
+			if !strings.Contains(stderr, c.want) {
+				t.Fatalf("expected %q in stderr, got %q", c.want, stderr)
+			}
+			if strings.Contains(stderr, "OPENAI_API_KEY") {
+				t.Fatalf("the missing key should not upstage the real mistake, got %q", stderr)
+			}
+		})
+	}
+}
