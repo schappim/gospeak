@@ -1,10 +1,10 @@
 # gospeak
 
-A self-contained command-line tool for text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS APIs — plus AI sound effect generation via ElevenLabs. Written in Go with no external dependencies like ffmpeg - just a single binary.
+A self-contained command-line tool for text-to-speech using OpenAI, ElevenLabs, Deepgram, or 60db TTS APIs — plus AI sound effect generation via ElevenLabs. Written in Go with no external dependencies like ffmpeg - just a single binary.
 
 ## Features
 
-- **Multiple TTS providers**: OpenAI, ElevenLabs, and Deepgram
+- **Multiple TTS providers**: OpenAI, ElevenLabs, Deepgram, and 60db
 - **Config file** - set your default provider and voice once in `~/.gospeak.json`
 - **Sound effects** - generate audio from a text description with `--sfx` (ElevenLabs)
 - **No ffmpeg required** - uses native Go audio libraries
@@ -20,7 +20,7 @@ A self-contained command-line tool for text-to-speech using OpenAI, ElevenLabs, 
 ## Requirements
 
 - macOS, Linux, or Windows
-- API key for your chosen provider (OpenAI, ElevenLabs, or Deepgram)
+- API key for your chosen provider (OpenAI, ElevenLabs, Deepgram, or 60db)
 
 ## Installation
 
@@ -64,6 +64,9 @@ export ELEVENLABS_API_KEY="your-elevenlabs-api-key"
 
 # For Deepgram
 export DEEPGRAM_API_KEY="your-deepgram-api-key"
+
+# For 60db
+export SIXTYDB_API_KEY="your-60db-api-key"
 ```
 
 Or pass the key directly with the `--token` flag.
@@ -102,7 +105,7 @@ Now `gospeak "Hello"` speaks with Josh on ElevenLabs, and `gospeak -v rachel
 
 | Key | Meaning |
 |-----|---------|
-| `provider` | Default provider: `openai`, `elevenlabs`, or `deepgram` |
+| `provider` | Default provider: `openai`, `elevenlabs`, `deepgram`, or `60db` |
 | `voice` | Default voice, used for whichever provider is in play |
 | `model` | Default model |
 | `speed` | Default speech speed |
@@ -217,6 +220,38 @@ You can also use any ElevenLabs voice_id directly:
 ```bash
 gospeak -p elevenlabs -v "21m00Tcm4TlvDq8ikWAM" "Using voice ID directly"
 ```
+
+### Using 60db
+
+```bash
+gospeak -p 60db -v "your-workspace-voice-id" "Hello from 60db"
+gospeak -p 60db -v "your-workspace-voice-id" -x 1.2 -o speech.mp3 "Hello"
+```
+
+Select a voice ID from your 60db workspace (`GET /voices`); there is no built-in
+voice preset or default. Set it with `-v` or the existing config file:
+
+```json
+{
+  "provider": "60db",
+  "providers": {
+    "60db": { "voice": "your-workspace-voice-id", "speed": 1.0 }
+  }
+}
+```
+
+The default model is `60db-fast-v01`; `-m` selects another model ID. Speed must
+be between `0.5` and `2.0`. Authentication uses `SIXTYDB_API_KEY` or `--token`.
+The provider uses the existing text chunking, retries, MP3 saving, and playback.
+
+Requests send `output_format: "mp3"`, as documented in the
+[60db TTS feature guide](https://docs.60db.ai/features/text-to-speech).
+The [API reference](https://docs.60db.ai/api-reference/tts/text-to-speech) also
+describes LINEAR16 streaming defaults. gospeak accepts binary MP3, JSON
+`audio_base64`, and NDJSON `result.audioContent`, including the SDK's nested
+base64 envelope, but rejects WAV, PCM, empty audio, and failed responses.
+If a model ignores the requested MP3 format, synthesis fails clearly instead
+of writing a mislabeled file. Responses are limited to 32 MiB per text chunk.
 
 ### Using Deepgram
 
@@ -353,7 +388,7 @@ gospeak -p elevenlabs -m eleven_turbo_v2_5 "Turbo model"
 
 | Option | Short | Description | Default |
 |--------|-------|-------------|---------|
-| `--provider` | `-p` | TTS provider (`openai`, `elevenlabs`) | `openai` |
+| `--provider` | `-p` | TTS provider (`openai`, `elevenlabs`, `deepgram`, `60db`) | `openai` |
 | `--voice` | `-v` | Voice to use | Provider-specific |
 | `--model` | `-m` | Model to use | Provider-specific |
 | `--output` | `-o` | Save audio to file | - |
@@ -373,15 +408,15 @@ gospeak -p elevenlabs -m eleven_turbo_v2_5 "Turbo model"
 
 ## Provider Comparison
 
-| Feature | OpenAI | ElevenLabs | Deepgram |
-|---------|--------|------------|----------|
-| Env var | `OPENAI_API_KEY` | `ELEVENLABS_API_KEY` | `DEEPGRAM_API_KEY` |
-| Default voice | `alloy` | `rachel` | `asteria` |
-| Default model | `tts-1-hd` | `eleven_multilingual_v2` | `aura-asteria-en` |
-| Speed range | 0.25 - 4.0 | 0.7 - 1.2 | Not supported |
-| Voice count | 13 built-in | 14 presets + custom | 18 presets + custom |
-| Custom voices | No | Yes (via voice_id) | Yes (via model name) |
-| Sound effects | No | Yes (`--sfx`) | No |
+| Feature | OpenAI | ElevenLabs | Deepgram | 60db |
+|---------|--------|------------|----------|------|
+| Env var | `OPENAI_API_KEY` | `ELEVENLABS_API_KEY` | `DEEPGRAM_API_KEY` | `SIXTYDB_API_KEY` |
+| Default voice | `alloy` | `rachel` | `asteria` | Required workspace voice ID |
+| Default model | `tts-1-hd` | `eleven_multilingual_v2` | `aura-asteria-en` | `60db-fast-v01` |
+| Speed range | 0.25 - 4.0 | 0.7 - 1.2 | Not supported | 0.5 - 2.0 |
+| Voice count | 13 built-in | 14 presets + custom | 18 presets + custom | Workspace voices |
+| Custom voices | No | Yes (via voice_id) | Yes (via model name) | Yes (via voice_id) |
+| Sound effects | No | Yes (`--sfx`) | No | No |
 
 ## Scripting Examples
 
@@ -459,7 +494,7 @@ When an error occurs, the tool outputs a message to stderr:
 Error: OPENAI_API_KEY environment variable not set and --token not provided
 Error: ELEVENLABS_API_KEY environment variable not set and --token not provided
 Error: DEEPGRAM_API_KEY environment variable not set and --token not provided
-Error: Invalid provider 'invalid'. Use 'openai', 'elevenlabs', or 'deepgram'
+Error: Invalid provider 'invalid'. Use 'openai', 'elevenlabs', 'deepgram', or '60db'
 Error: Speed must be between 0.25 and 4.0 for OpenAI
 Error: Speed must be between 0.7 and 1.2 for ElevenLabs
 Warning: Speed adjustment is not supported for Deepgram, ignoring
@@ -468,7 +503,7 @@ Error: Duration must be between 0.5 and 30 seconds
 Error: Influence must be between 0.0 and 1.0
 Error: --all cannot be combined with --sfx
 Error: parsing config /Users/you/.gospeak.json: json: unknown field "provdier"
-Error: config /Users/you/.gospeak.json: invalid provider "azure" (use openai, elevenlabs, or deepgram)
+Error: config /Users/you/.gospeak.json: invalid provider "azure" (use openai, elevenlabs, deepgram, or 60db)
 Error: Invalid OpenAI voice 'josh' (from /Users/you/.gospeak.json). Valid voices: alloy, ash, ...
 Error: Voice 'marin' needs the gpt-4o-mini-tts model, which 'tts-1-hd' is not. Drop -m, or pass -m gpt-4o-mini-tts
 ```
