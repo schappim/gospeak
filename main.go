@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"flag"
@@ -41,6 +42,8 @@ const (
 	// Deepgram defaults
 	defaultDeepgramVoice = "aura-asteria-en"
 
+	defaultSixtyDBModel = "60db-fast-v01"
+
 	defaultSpeed    = 1.0
 	defaultProvider = "openai"
 
@@ -64,6 +67,7 @@ var (
 	elevenLabsAPIURL    = "https://api.elevenlabs.io/v1/text-to-speech"
 	elevenLabsSFXAPIURL = "https://api.elevenlabs.io/v1/sound-generation"
 	deepgramAPIURL      = "https://api.deepgram.com/v1/speak"
+	sixtyDBAPIURL       = "https://api.60db.ai/tts-synthesize"
 )
 
 // The full OpenAI voice roster. marin and cedar are the two OpenAI singles out
@@ -259,7 +263,7 @@ func loadConfig(flagPath string, getenv func(string) string) (*config, error) {
 	if cfg.Provider != "" {
 		cfg.Provider = strings.ToLower(cfg.Provider)
 		if !isValidProvider(cfg.Provider) {
-			return nil, fmt.Errorf("config %s: invalid provider %q (use openai, elevenlabs, or deepgram)", path, cfg.Provider)
+			return nil, fmt.Errorf("config %s: invalid provider %q (use openai, elevenlabs, deepgram, or 60db)", path, cfg.Provider)
 		}
 	}
 	if len(cfg.Providers) > 0 {
@@ -267,7 +271,7 @@ func loadConfig(flagPath string, getenv func(string) string) (*config, error) {
 		for name, pc := range cfg.Providers {
 			lower := strings.ToLower(name)
 			if !isValidProvider(lower) {
-				return nil, fmt.Errorf("config %s: unknown provider %q under \"providers\" (use openai, elevenlabs, or deepgram)", path, name)
+				return nil, fmt.Errorf("config %s: unknown provider %q under \"providers\" (use openai, elevenlabs, deepgram, or 60db)", path, name)
 			}
 			byProvider[lower] = pc
 		}
@@ -322,7 +326,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	fs := flag.NewFlagSet("gospeak", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	fs.StringVar(&provider, "provider", defaultProvider, "TTS provider (openai, elevenlabs, deepgram)")
+	fs.StringVar(&provider, "provider", defaultProvider, "TTS provider (openai, elevenlabs, deepgram, 60db)")
 	fs.StringVar(&provider, "p", defaultProvider, "TTS provider (shorthand)")
 	fs.StringVar(&voice, "voice", "", "Voice to use (see --help for options)")
 	fs.StringVar(&voice, "v", "", "Voice to use (shorthand)")
@@ -349,11 +353,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	fs.BoolVar(&noConfig, "no-config", false, "Ignore the config file")
 
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS API\n\n")
+		fmt.Fprintf(stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, Deepgram, or 60db TTS API\n\n")
 		fmt.Fprintf(stderr, "Usage: gospeak [options] [text]\n")
 		fmt.Fprintf(stderr, "       echo 'text' | gospeak [options]\n\n")
 		fmt.Fprintf(stderr, "Options:\n")
-		fmt.Fprintf(stderr, "  -p, --provider    TTS provider: openai, elevenlabs, deepgram (default: openai)\n")
+		fmt.Fprintf(stderr, "  -p, --provider    TTS provider: openai, elevenlabs, deepgram, 60db (default: openai)\n")
 		fmt.Fprintf(stderr, "  -v, --voice       Voice to use (see below for options)\n")
 		fmt.Fprintf(stderr, "  -m, --model       Model to use\n")
 		fmt.Fprintf(stderr, "  -o, --output      Save audio to this file\n")
@@ -406,6 +410,12 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "           Aura 2: thalia, andromeda, helena, jason, apollo, ares\n")
 		fmt.Fprintf(stderr, "           (or use a model name directly like aura-asteria-en)\n")
 		fmt.Fprintf(stderr, "  Note:    Speed adjustment not supported\n\n")
+
+		fmt.Fprintf(stderr, "60db:\n")
+		fmt.Fprintf(stderr, "  Env var: SIXTYDB_API_KEY\n")
+		fmt.Fprintf(stderr, "  Voice:   required workspace voice_id (-v or config); no preset default\n")
+		fmt.Fprintf(stderr, "  Model:   %s (default); override with -m\n", defaultSixtyDBModel)
+		fmt.Fprintf(stderr, "  Speed:   0.5 to 2.0; output: MP3\n\n")
 
 		fmt.Fprintf(stderr, "Config file (~/.gospeak.json):\n")
 		fmt.Fprintf(stderr, "  Optional JSON file holding the defaults every run starts from. Any flag\n")
@@ -506,7 +516,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	}
 
 	if !isValidProvider(provider) {
-		fmt.Fprintf(stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', or 'deepgram'\n", provider)
+		fmt.Fprintf(stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', 'deepgram', or '60db'\n", provider)
 		return 1
 	}
 
@@ -559,6 +569,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			model = defaultOpenAIModel
 		case provider == "elevenlabs":
 			model = defaultElevenLabsModel
+		case provider == "60db":
+			model = defaultSixtyDBModel
 		case provider == "deepgram":
 			model = ""
 		}
@@ -586,6 +598,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		model = openAIModelForVoice(model, voice)
 	}
 
+	if provider == "60db" && strings.TrimSpace(voice) == "" {
+		fmt.Fprintln(stderr, "Error: 60db requires a workspace voice_id; pass -v or set voice in the config file")
+		return 1
+	}
+
 	apiKey := token
 	if apiKey == "" {
 		switch provider {
@@ -595,6 +612,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			apiKey = getenv("ELEVENLABS_API_KEY")
 		case "deepgram":
 			apiKey = getenv("DEEPGRAM_API_KEY")
+		case "60db":
+			apiKey = getenv("SIXTYDB_API_KEY")
 		}
 	}
 	if apiKey == "" {
@@ -602,6 +621,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			"openai":     "OPENAI_API_KEY",
 			"elevenlabs": "ELEVENLABS_API_KEY",
 			"deepgram":   "DEEPGRAM_API_KEY",
+			"60db":       "SIXTYDB_API_KEY",
 		}
 		fmt.Fprintf(stderr, "Error: %s environment variable not set and --token not provided\n", envVars[provider])
 		return 1
@@ -630,6 +650,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		case "elevenlabs":
 			if speed < 0.7 || speed > 1.2 {
 				fmt.Fprintln(stderr, "Error: Speed must be between 0.7 and 1.2 for ElevenLabs")
+				return 1
+			}
+		case "60db":
+			if !(speed >= 0.5 && speed <= 2.0) {
+				fmt.Fprintln(stderr, "Error: Speed must be between 0.5 and 2.0 for 60db")
 				return 1
 			}
 		case "deepgram":
@@ -727,6 +752,10 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeElevenLabs(apiKey, model, voiceID, chunk, speed, stability, similarityBoost)
 		})
+	case provider == "60db":
+		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
+			return synthesizeSixtyDB(apiKey, model, voice, chunk, speed)
+		})
 	case provider == "deepgram":
 		voiceModel := resolveDeepgramVoice(voice)
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
@@ -771,7 +800,7 @@ func flagName(name string) string {
 }
 
 func isValidProvider(provider string) bool {
-	return provider == "openai" || provider == "elevenlabs" || provider == "deepgram"
+	return provider == "openai" || provider == "elevenlabs" || provider == "deepgram" || provider == "60db"
 }
 
 // speaksEveryOpenAIVoice reports whether a model can handle the whole roster.
@@ -1133,6 +1162,134 @@ func synthesizeDeepgram(apiKey, voiceModel, text string) ([]byte, error) {
 	}
 
 	return io.ReadAll(resp.Body)
+}
+
+// 60db can return binary MP3, JSON, or NDJSON. Keep each response bounded
+// and unwrap only the one additional base64 envelope used by its SDK.
+const maxSixtyDBResponseSize = 32 << 20
+
+type sixtyDBResponse struct {
+	Success         *bool            `json:"success"`
+	Type            string           `json:"type"`
+	Message         string           `json:"message"`
+	Error           json.RawMessage  `json:"error"`
+	AudioBase64     string           `json:"audio_base64"`
+	AudioContent    string           `json:"audioContent"`
+	Encoding        string           `json:"encoding"`
+	OutputFormat    string           `json:"output_format"`
+	Result          *sixtyDBResponse `json:"result"`
+	BackendResponse *sixtyDBResponse `json:"backendResponse"`
+}
+
+func synthesizeSixtyDB(apiKey, model, voiceID, text string, speed float64) ([]byte, error) {
+	body, err := json.Marshal(struct {
+		Text         string  `json:"text"`
+		VoiceID      string  `json:"voice_id"`
+		ModelID      string  `json:"model_id"`
+		Speed        float64 `json:"speed"`
+		OutputFormat string  `json:"output_format"`
+	}{text, voiceID, model, speed, "mp3"})
+	if err != nil {
+		return nil, permanent(fmt.Errorf("failed to marshal request: %w", err))
+	}
+	req, err := http.NewRequest(http.MethodPost, sixtyDBAPIURL, bytes.NewReader(body))
+	if err != nil {
+		return nil, permanent(fmt.Errorf("failed to create request: %w", err))
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	resp, err := (&http.Client{Timeout: 120 * time.Second}).Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+	// apiError retains the existing retry policy, with a bounded error body.
+	resp.Body = io.NopCloser(io.LimitReader(resp.Body, maxSixtyDBResponseSize+1))
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("reading 60db response: %w", err)
+	}
+	if len(data) > maxSixtyDBResponseSize {
+		return nil, permanent(fmt.Errorf("60db response exceeds %d bytes", maxSixtyDBResponseSize))
+	}
+	contentType := strings.ToLower(strings.Split(resp.Header.Get("Content-Type"), ";")[0])
+	if strings.HasPrefix(contentType, "audio/") || contentType == "application/octet-stream" {
+		return validateSixtyDBMP3(data)
+	}
+	var audio []byte
+	dec := json.NewDecoder(bytes.NewReader(data))
+	for {
+		var envelope sixtyDBResponse
+		if err := dec.Decode(&envelope); err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, permanent(fmt.Errorf("invalid 60db JSON response: %w", err))
+		}
+		chunk, err := decodeSixtyDBEnvelope(&envelope, 0)
+		if err != nil {
+			return nil, permanent(err)
+		}
+		audio = append(audio, chunk...)
+	}
+	return validateSixtyDBMP3(audio)
+}
+
+func decodeSixtyDBEnvelope(r *sixtyDBResponse, depth int) ([]byte, error) {
+	if depth > 3 {
+		return nil, fmt.Errorf("60db response has too many nested audio envelopes")
+	}
+	if (r.Success != nil && !*r.Success) || r.Type == "error" || (len(r.Error) > 0 && string(r.Error) != "null") {
+		return nil, fmt.Errorf("60db synthesis failed: %s", r.Message)
+	}
+	for _, format := range []string{r.Encoding, r.OutputFormat} {
+		if format != "" && !strings.EqualFold(format, "mp3") && !strings.EqualFold(format, "mpeg") {
+			return nil, fmt.Errorf("60db returned %q audio; MP3 is required", format)
+		}
+	}
+	if r.BackendResponse != nil {
+		return decodeSixtyDBEnvelope(r.BackendResponse, depth+1)
+	}
+	if r.Result != nil {
+		return decodeSixtyDBEnvelope(r.Result, depth+1)
+	}
+	encoded := r.AudioBase64
+	if encoded == "" {
+		encoded = r.AudioContent
+	}
+	if encoded == "" {
+		// Metadata and timestamp records carry no audio.
+		return nil, nil
+	}
+	data, err := base64.StdEncoding.DecodeString(encoded)
+	if err != nil {
+		return nil, fmt.Errorf("invalid 60db audio base64: %w", err)
+	}
+	if bytes.HasPrefix(bytes.TrimSpace(data), []byte("{")) {
+		if depth >= 2 {
+			return nil, fmt.Errorf("60db response has too many base64 audio envelopes")
+		}
+		var inner sixtyDBResponse
+		if err := json.Unmarshal(data, &inner); err != nil {
+			return nil, fmt.Errorf("invalid 60db audio envelope: %w", err)
+		}
+		return decodeSixtyDBEnvelope(&inner, depth+1)
+	}
+	return data, nil
+}
+
+func validateSixtyDBMP3(data []byte) ([]byte, error) {
+	// The existing chunk joiner and player require MP3; never save PCM as .mp3.
+	frames := stripID3v2(data)
+	if len(frames) >= 4 && frames[0] == 0xff && frames[1]&0xe0 == 0xe0 &&
+		frames[1]&0x18 != 0x08 && frames[1]&0x06 == 0x02 &&
+		frames[2]&0xf0 != 0xf0 && frames[2]&0xf0 != 0 && frames[2]&0x0c != 0x0c {
+		return data, nil
+	}
+	return nil, permanent(fmt.Errorf("60db returned empty or unsupported audio; expected MP3 (WAV/PCM cannot be played or saved as MP3)"))
 }
 
 func playAudio(audioData []byte) error {
