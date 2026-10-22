@@ -41,6 +41,10 @@ const (
 	// Deepgram defaults
 	defaultDeepgramVoice = "aura-asteria-en"
 
+	// Speechify defaults
+	defaultSpeechifyVoice = "geffen_32"
+	defaultSpeechifyModel = "simba-3.5"
+
 	defaultSpeed    = 1.0
 	defaultProvider = "openai"
 
@@ -64,7 +68,11 @@ var (
 	elevenLabsAPIURL    = "https://api.elevenlabs.io/v1/text-to-speech"
 	elevenLabsSFXAPIURL = "https://api.elevenlabs.io/v1/sound-generation"
 	deepgramAPIURL      = "https://api.deepgram.com/v1/speak"
+	speechifyAPIURL     = "https://api.speechify.ai/v1/audio/stream"
 )
+
+// Sent on Speechify requests so Speechify can tell which tool is calling.
+const speechifyCaller = "gospeak"
 
 // The full OpenAI voice roster. marin and cedar are the two OpenAI singles out
 // as the best quality.
@@ -123,6 +131,25 @@ var deepgramVoices = map[string]string{
 	"jason":     "aura-2-jason-en",
 	"apollo":    "aura-2-apollo-en",
 	"ares":      "aura-2-ares-en",
+}
+
+// Speechify voice presets (short name -> voice_id)
+var speechifyVoices = map[string]string{
+	"geffen":   "geffen_32",
+	"harper":   "harper_32",
+	"dominic":  "dominic_32",
+	"wyatt":    "wyatt_32",
+	"beatrice": "beatrice_32",
+	"imogen":   "imogen_32",
+	"edmund":   "edmund_32",
+	"hugh":     "hugh_32",
+}
+
+// Speechify TTS request
+type SpeechifyTTSRequest struct {
+	Input   string `json:"input"`
+	VoiceID string `json:"voice_id"`
+	Model   string `json:"model"`
 }
 
 // Deepgram TTS request
@@ -259,7 +286,7 @@ func loadConfig(flagPath string, getenv func(string) string) (*config, error) {
 	if cfg.Provider != "" {
 		cfg.Provider = strings.ToLower(cfg.Provider)
 		if !isValidProvider(cfg.Provider) {
-			return nil, fmt.Errorf("config %s: invalid provider %q (use openai, elevenlabs, or deepgram)", path, cfg.Provider)
+			return nil, fmt.Errorf("config %s: invalid provider %q (use openai, elevenlabs, deepgram, or speechify)", path, cfg.Provider)
 		}
 	}
 	if len(cfg.Providers) > 0 {
@@ -267,7 +294,7 @@ func loadConfig(flagPath string, getenv func(string) string) (*config, error) {
 		for name, pc := range cfg.Providers {
 			lower := strings.ToLower(name)
 			if !isValidProvider(lower) {
-				return nil, fmt.Errorf("config %s: unknown provider %q under \"providers\" (use openai, elevenlabs, or deepgram)", path, name)
+				return nil, fmt.Errorf("config %s: unknown provider %q under \"providers\" (use openai, elevenlabs, deepgram, or speechify)", path, name)
 			}
 			byProvider[lower] = pc
 		}
@@ -322,7 +349,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	fs := flag.NewFlagSet("gospeak", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	fs.StringVar(&provider, "provider", defaultProvider, "TTS provider (openai, elevenlabs, deepgram)")
+	fs.StringVar(&provider, "provider", defaultProvider, "TTS provider (openai, elevenlabs, deepgram, speechify)")
 	fs.StringVar(&provider, "p", defaultProvider, "TTS provider (shorthand)")
 	fs.StringVar(&voice, "voice", "", "Voice to use (see --help for options)")
 	fs.StringVar(&voice, "v", "", "Voice to use (shorthand)")
@@ -349,11 +376,12 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	fs.BoolVar(&noConfig, "no-config", false, "Ignore the config file")
 
 	fs.Usage = func() {
-		fmt.Fprintf(stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, or Deepgram TTS API\n\n")
+		fmt.Fprintf(stderr, "gospeak - Text-to-speech using OpenAI, ElevenLabs, Deepgram, or Speechify TTS API\n\n")
 		fmt.Fprintf(stderr, "Usage: gospeak [options] [text]\n")
 		fmt.Fprintf(stderr, "       echo 'text' | gospeak [options]\n\n")
 		fmt.Fprintf(stderr, "Options:\n")
-		fmt.Fprintf(stderr, "  -p, --provider    TTS provider: openai, elevenlabs, deepgram (default: openai)\n")
+		fmt.Fprintf(stderr, "  -p, --provider    TTS provider: openai, elevenlabs, deepgram,\n")
+		fmt.Fprintf(stderr, "                    speechify (default: openai)\n")
 		fmt.Fprintf(stderr, "  -v, --voice       Voice to use (see below for options)\n")
 		fmt.Fprintf(stderr, "  -m, --model       Model to use\n")
 		fmt.Fprintf(stderr, "  -o, --output      Save audio to this file\n")
@@ -407,6 +435,14 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "           (or use a model name directly like aura-asteria-en)\n")
 		fmt.Fprintf(stderr, "  Note:    Speed adjustment not supported\n\n")
 
+		fmt.Fprintf(stderr, "Speechify:\n")
+		fmt.Fprintf(stderr, "  Env var: SPEECHIFY_API_KEY\n")
+		fmt.Fprintf(stderr, "  Voices:  geffen (default), harper, dominic, wyatt, beatrice,\n")
+		fmt.Fprintf(stderr, "           imogen, edmund, hugh\n")
+		fmt.Fprintf(stderr, "           (or use a voice_id directly)\n")
+		fmt.Fprintf(stderr, "  Models:  simba-3.5 (default, 48 languages), simba-3.2 (English), simba-3.0\n")
+		fmt.Fprintf(stderr, "  Note:    Speed adjustment not supported\n\n")
+
 		fmt.Fprintf(stderr, "Config file (~/.gospeak.json):\n")
 		fmt.Fprintf(stderr, "  Optional JSON file holding the defaults every run starts from. Any flag\n")
 		fmt.Fprintf(stderr, "  you type overrides it. API keys stay in environment variables.\n")
@@ -427,6 +463,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		fmt.Fprintf(stderr, "  gospeak \"Hello, world!\"\n")
 		fmt.Fprintf(stderr, "  gospeak -p elevenlabs -v rachel \"Hello from ElevenLabs\"\n")
 		fmt.Fprintf(stderr, "  gospeak -p deepgram -v asteria \"Hello from Deepgram\"\n")
+		fmt.Fprintf(stderr, "  gospeak -p speechify -v harper \"Hello from Speechify\"\n")
 		fmt.Fprintf(stderr, "  echo \"Hello\" | gospeak -v nova\n")
 		fmt.Fprintf(stderr, "  gospeak -o output.mp3 \"Save this to a file\"\n")
 		fmt.Fprintf(stderr, "  gospeak --sfx \"glass shattering on concrete\"\n")
@@ -506,7 +543,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 	}
 
 	if !isValidProvider(provider) {
-		fmt.Fprintf(stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', or 'deepgram'\n", provider)
+		fmt.Fprintf(stderr, "Error: Invalid provider '%s'. Use 'openai', 'elevenlabs', 'deepgram', or 'speechify'\n", provider)
 		return 1
 	}
 
@@ -549,6 +586,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			voice = defaultElevenLabsVoice
 		case "deepgram":
 			voice = defaultDeepgramVoice
+		case "speechify":
+			voice = defaultSpeechifyVoice
 		}
 	}
 	if model == "" {
@@ -561,6 +600,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			model = defaultElevenLabsModel
 		case provider == "deepgram":
 			model = ""
+		case provider == "speechify":
+			model = defaultSpeechifyModel
 		}
 	}
 
@@ -595,6 +636,8 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			apiKey = getenv("ELEVENLABS_API_KEY")
 		case "deepgram":
 			apiKey = getenv("DEEPGRAM_API_KEY")
+		case "speechify":
+			apiKey = getenv("SPEECHIFY_API_KEY")
 		}
 	}
 	if apiKey == "" {
@@ -602,6 +645,7 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			"openai":     "OPENAI_API_KEY",
 			"elevenlabs": "ELEVENLABS_API_KEY",
 			"deepgram":   "DEEPGRAM_API_KEY",
+			"speechify":  "SPEECHIFY_API_KEY",
 		}
 		fmt.Fprintf(stderr, "Error: %s environment variable not set and --token not provided\n", envVars[provider])
 		return 1
@@ -639,6 +683,10 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 			// on every Deepgram run would be noise, not information.
 			if speed != defaultSpeed && (wasSet("speed", "x") || speedFromProviderConfig) {
 				fmt.Fprintln(stderr, "Warning: Speed adjustment is not supported for Deepgram, ignoring")
+			}
+		case "speechify":
+			if speed != defaultSpeed && (wasSet("speed", "x") || speedFromProviderConfig) {
+				fmt.Fprintln(stderr, "Warning: Speed adjustment is not supported for Speechify, ignoring")
 			}
 		}
 	}
@@ -732,6 +780,11 @@ func run(args []string, stdin io.Reader, stderr io.Writer, getenv func(string) s
 		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
 			return synthesizeDeepgram(apiKey, voiceModel, chunk)
 		})
+	case provider == "speechify":
+		voiceID := resolveSpeechifyVoice(voice)
+		audioData, err = synthesizeChunked(text, func(chunk string) ([]byte, error) {
+			return synthesizeSpeechify(apiKey, model, voiceID, chunk)
+		})
 	}
 
 	if err != nil {
@@ -771,7 +824,7 @@ func flagName(name string) string {
 }
 
 func isValidProvider(provider string) bool {
-	return provider == "openai" || provider == "elevenlabs" || provider == "deepgram"
+	return provider == "openai" || provider == "elevenlabs" || provider == "deepgram" || provider == "speechify"
 }
 
 // speaksEveryOpenAIVoice reports whether a model can handle the whole roster.
@@ -814,6 +867,15 @@ func resolveDeepgramVoice(voice string) string {
 		return model
 	}
 	// Otherwise assume it's a full model name (e.g., aura-asteria-en)
+	return voice
+}
+
+func resolveSpeechifyVoice(voice string) string {
+	// Check if it's a preset name
+	if id, ok := speechifyVoices[strings.ToLower(voice)]; ok {
+		return id
+	}
+	// Otherwise assume it's a voice_id
 	return voice
 }
 
@@ -1120,6 +1182,42 @@ func synthesizeDeepgram(apiKey, voiceModel, text string) ([]byte, error) {
 
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Token "+apiKey)
+
+	client := &http.Client{Timeout: 120 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to make request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, apiError(resp)
+	}
+
+	return io.ReadAll(resp.Body)
+}
+
+func synthesizeSpeechify(apiKey, model, voiceID, text string) ([]byte, error) {
+	reqBody := SpeechifyTTSRequest{
+		Input:   text,
+		VoiceID: voiceID,
+		Model:   model,
+	}
+
+	jsonData, err := json.Marshal(reqBody)
+	if err != nil {
+		return nil, permanent(fmt.Errorf("failed to marshal request: %w", err))
+	}
+
+	req, err := http.NewRequest("POST", speechifyAPIURL, bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Accept", "audio/mpeg")
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("Speechify-Caller", speechifyCaller)
 
 	client := &http.Client{Timeout: 120 * time.Second}
 	resp, err := client.Do(req)

@@ -563,6 +563,68 @@ func TestSynthesizeDeepgram_ReturnsErrorOnNon200(t *testing.T) {
 	}
 }
 
+func TestSynthesizeSpeechify_SendsExpectedRequest(t *testing.T) {
+	wantAudio := []byte{0xFF, 0xFB, 0x90, 0x44, 'S', 'P'}
+
+	var captured struct {
+		method, auth, accept string
+		caller               string
+		body                 SpeechifyTTSRequest
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured.method = r.Method
+		captured.auth = r.Header.Get("Authorization")
+		captured.accept = r.Header.Get("Accept")
+		captured.caller = r.Header.Get("Speechify-Caller")
+		_ = json.NewDecoder(r.Body).Decode(&captured.body)
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(wantAudio)
+	}))
+	defer server.Close()
+
+	defer swapURL(&speechifyAPIURL, server.URL)()
+
+	got, err := synthesizeSpeechify("sp-test", "simba-3.5", "geffen_32", "hello speechify")
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if !bytesEqual(got, wantAudio) {
+		t.Fatalf("audio mismatch: got %x, want %x", got, wantAudio)
+	}
+	if captured.method != http.MethodPost {
+		t.Errorf("method = %q, want POST", captured.method)
+	}
+	if captured.auth != "Bearer sp-test" {
+		t.Errorf("auth = %q, want %q", captured.auth, "Bearer sp-test")
+	}
+	if captured.accept != "audio/mpeg" {
+		t.Errorf("accept = %q, want audio/mpeg", captured.accept)
+	}
+	if captured.caller != "gospeak" {
+		t.Errorf("Speechify-Caller = %q, want gospeak", captured.caller)
+	}
+	if captured.body.Input != "hello speechify" || captured.body.VoiceID != "geffen_32" || captured.body.Model != "simba-3.5" {
+		t.Errorf("body mismatch: %+v", captured.body)
+	}
+}
+
+func TestSynthesizeSpeechify_ReturnsErrorOnNon200(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusUnauthorized)
+		_, _ = io.WriteString(w, `{"error":"bad key"}`)
+	}))
+	defer server.Close()
+	defer swapURL(&speechifyAPIURL, server.URL)()
+
+	_, err := synthesizeSpeechify("sp", "simba-3.5", "geffen_32", "hi")
+	if err == nil {
+		t.Fatal("expected error on 401")
+	}
+	if !strings.Contains(err.Error(), "401") || !strings.Contains(err.Error(), "bad key") {
+		t.Fatalf("expected status and body in error, got %v", err)
+	}
+}
+
 func TestSynthesizeOpenAI_FailsOnUnreachable(t *testing.T) {
 	defer swapURL(&openAIAPIURL, unreachableURL(t))()
 	_, err := synthesizeOpenAI("sk", "tts-1", "alloy", "hi", 1.0)
@@ -581,6 +643,12 @@ func TestSynthesizeDeepgram_FailsOnUnreachable(t *testing.T) {
 	assertNetworkError(t, err)
 }
 
+func TestSynthesizeSpeechify_FailsOnUnreachable(t *testing.T) {
+	defer swapURL(&speechifyAPIURL, unreachableURL(t))()
+	_, err := synthesizeSpeechify("sp", "simba-3.5", "geffen_32", "hi")
+	assertNetworkError(t, err)
+}
+
 func TestSynthesizeOpenAI_FailsOnMalformedURL(t *testing.T) {
 	defer swapURL(&openAIAPIURL, "://no-scheme")()
 	_, err := synthesizeOpenAI("sk", "tts-1", "alloy", "hi", 1.0)
@@ -596,6 +664,12 @@ func TestSynthesizeElevenLabs_FailsOnMalformedURL(t *testing.T) {
 func TestSynthesizeDeepgram_FailsOnMalformedURL(t *testing.T) {
 	defer swapURL(&deepgramAPIURL, "://no-scheme")()
 	_, err := synthesizeDeepgram("dg", "aura-asteria-en", "hi")
+	assertRequestBuildError(t, err)
+}
+
+func TestSynthesizeSpeechify_FailsOnMalformedURL(t *testing.T) {
+	defer swapURL(&speechifyAPIURL, "://no-scheme")()
+	_, err := synthesizeSpeechify("sp", "simba-3.5", "geffen_32", "hi")
 	assertRequestBuildError(t, err)
 }
 
@@ -814,6 +888,7 @@ func TestRun_MissingAPIKeyPerProvider(t *testing.T) {
 		{"openai", "OPENAI_API_KEY"},
 		{"elevenlabs", "ELEVENLABS_API_KEY"},
 		{"deepgram", "DEEPGRAM_API_KEY"},
+		{"speechify", "SPEECHIFY_API_KEY"},
 	}
 	for _, c := range cases {
 		t.Run(c.provider, func(t *testing.T) {
@@ -877,6 +952,34 @@ func TestRun_DeepgramSpeedWarnsButContinues(t *testing.T) {
 	}
 	if !strings.Contains(stderr, "Speed adjustment is not supported") {
 		t.Errorf("expected speed warning in stderr, got %q", stderr)
+	}
+}
+
+func TestRun_SpeechifyUsesDefaultsAndWarnsOnSpeed(t *testing.T) {
+	var body SpeechifyTTSRequest
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		_, _ = w.Write([]byte{0xFF, 0xFB, 0x90, 0x44})
+	}))
+	defer server.Close()
+	defer swapURL(&speechifyAPIURL, server.URL)()
+
+	dir := t.TempDir()
+	out := dir + "/x.mp3"
+	code, stderr := runCLI(t, []string{
+		"-p", "speechify", "-x", "1.5", "-o", out, "hi",
+	}, "", envMap(map[string]string{"SPEECHIFY_API_KEY": "k"}))
+	if code != 0 {
+		t.Fatalf("exit code = %d, want 0, stderr=%q", code, stderr)
+	}
+	if !strings.Contains(stderr, "Speed adjustment is not supported for Speechify") {
+		t.Errorf("expected speed warning in stderr, got %q", stderr)
+	}
+	if body.VoiceID != defaultSpeechifyVoice || body.Model != defaultSpeechifyModel {
+		t.Errorf("request used voice %q model %q, want defaults", body.VoiceID, body.Model)
+	}
+	if body.Model != "simba-3.5" {
+		t.Errorf("default Speechify model = %q, want simba-3.5", body.Model)
 	}
 }
 
@@ -1371,6 +1474,21 @@ func TestResolveDeepgramVoice(t *testing.T) {
 	for _, c := range cases {
 		if got := resolveDeepgramVoice(c.in); got != c.want {
 			t.Errorf("resolveDeepgramVoice(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+}
+
+func TestResolveSpeechifyVoice(t *testing.T) {
+	cases := []struct {
+		in, want string
+	}{
+		{"geffen", "geffen_32"},
+		{"HARPER", "harper_32"},
+		{"my-cloned-voice", "my-cloned-voice"}, // voice_id passes through
+	}
+	for _, c := range cases {
+		if got := resolveSpeechifyVoice(c.in); got != c.want {
+			t.Errorf("resolveSpeechifyVoice(%q) = %q, want %q", c.in, got, c.want)
 		}
 	}
 }
@@ -2246,7 +2364,7 @@ func (r *recordedRequest) decodeElevenLabs(t *testing.T) ElevenLabsTTSRequest {
 }
 
 func TestIsValidProvider(t *testing.T) {
-	for _, valid := range []string{"openai", "elevenlabs", "deepgram"} {
+	for _, valid := range []string{"openai", "elevenlabs", "deepgram", "speechify"} {
 		if !isValidProvider(valid) {
 			t.Errorf("isValidProvider(%q) = false, want true", valid)
 		}
